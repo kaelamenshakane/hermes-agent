@@ -809,6 +809,52 @@ class TestBusySessionOnboardingHint:
         create_subprocess.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_baldr_enqueue_link_review_passes_matrix_metadata(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        event = _make_event(text="смотри https://example.com/tool", chat_id="!room:matrix.org", platform_val=Platform.MATRIX)
+        event.source.user_name = "bell"
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b'{"queued": true, "item": {"id": "link-review-123"}}', b"")
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+        item = await GatewayRunner._baldr_enqueue_link_review(
+            runner,
+            event,
+            reply_anchor_text="чотам по ссылке",
+        )
+
+        assert item == {"id": "link-review-123"}
+        assert captured["args"][:10] == (
+            "/srv/agent/scripts/baldr-link-review-queue.py",
+            "enqueue",
+            "--text",
+            "смотри https://example.com/tool",
+            "--source",
+            "matrix",
+            "--message-id",
+            "msg1",
+            "--chat-id",
+            "!room:matrix.org",
+        )
+        assert "bell" in captured["args"]
+        assert "чотам по ссылке" in captured["args"]
+        assert captured["kwargs"]["stdout"] == asyncio.subprocess.PIPE
+        assert captured["kwargs"]["stderr"] == asyncio.subprocess.DEVNULL
+
+    @pytest.mark.asyncio
     async def test_baldr_matrix_busy_route_appends_durable_route_event(self, monkeypatch):
         """Busy-path routing should persist a durable event with reply anchor and target."""
         import gateway.run as _gr
@@ -844,6 +890,11 @@ class TestBusySessionOnboardingHint:
 
         monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
         monkeypatch.setattr(_gr.GatewayRunner, "_append_baldr_route_event", fake_append)
+        monkeypatch.setattr(
+            _gr.GatewayRunner,
+            "_baldr_enqueue_link_review",
+            AsyncMock(return_value={"id": "link-review-123"}),
+        )
 
         with patch("gateway.run.merge_pending_message_event") as mock_merge:
             result = await runner._handle_active_session_busy_message(event, sk)
@@ -864,6 +915,7 @@ class TestBusySessionOnboardingHint:
         assert route_event["target_task_id"] == "selfhost-llm-vast-deploy"
         assert route_event["target_worker"] == "planner/selfhost"
         assert route_event["should_interrupt"] is False
+        assert route_event["link_review_queue_id"] == "link-review-123"
 
     @pytest.mark.asyncio
     async def test_baldr_matrix_busy_background_route_preserves_queue_order(self, monkeypatch):

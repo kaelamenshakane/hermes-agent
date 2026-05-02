@@ -2099,6 +2099,56 @@ class GatewayRunner:
             logger.debug("Baldr gateway hook failed: %s", exc)
             return None
 
+    async def _baldr_enqueue_link_review(
+        self,
+        event: MessageEvent,
+        *,
+        reply_anchor_text: Optional[str] = None,
+        timeout: float = 1.5,
+    ) -> Optional[Dict[str, Any]]:
+        """Durably enqueue URL-bearing Matrix text for later link safety review.
+
+        Fail-open: if the helper is unavailable or the text has no URLs, busy-path
+        routing should continue normally without surfacing an error to the user.
+        """
+        script = Path("/srv/agent/scripts/baldr-link-review-queue.py")
+        if not script.exists():
+            return None
+
+        text = (event.text or "").strip()
+        if not text:
+            return None
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                "enqueue",
+                "--text",
+                text,
+                "--source",
+                "matrix",
+                "--message-id",
+                str(event.message_id or ""),
+                "--chat-id",
+                str(event.source.chat_id or ""),
+                "--sender",
+                str(getattr(event.source, "user_name", None) or getattr(event.source, "user_id", None) or ""),
+                "--reply-anchor-text",
+                str(reply_anchor_text or ""),
+                "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0 or not stdout:
+                return None
+            payload = json.loads(stdout.decode("utf-8", errors="replace"))
+            item = payload.get("item") if isinstance(payload, dict) else None
+            return item if isinstance(item, dict) else None
+        except Exception as exc:
+            logger.debug("Baldr link-review enqueue failed for %s: %s", event.message_id or "?", exc)
+            return None
+
     async def _baldr_status_text(self, reply_context_text: Optional[str] = None) -> Optional[str]:
         """Return a compact Baldr control-plane snapshot for Matrix busy replies."""
         if reply_context_text:
@@ -2261,6 +2311,10 @@ class GatewayRunner:
         execution = str(decision.get("execution") or "answer_now")
         priority = str(decision.get("priority") or "normal")
         should_interrupt = self._baldr_should_interrupt_busy_turn(text, lane, priority)
+        link_review_item = await self._baldr_enqueue_link_review(
+            event,
+            reply_anchor_text=str(reply_text)[:500] if reply_text else None,
+        )
         route_event = {
             "source": "matrix-busy-router",
             "session_key": session_key,
@@ -2276,6 +2330,7 @@ class GatewayRunner:
             "target_task_id": decision.get("task_id") or decision.get("target_task_id"),
             "target_worker": decision.get("target_worker") or decision.get("worker"),
             "should_interrupt": should_interrupt,
+            "link_review_queue_id": link_review_item.get("id") if isinstance(link_review_item, dict) else None,
         }
         self._append_baldr_route_event(route_event)
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
