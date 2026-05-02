@@ -232,6 +232,18 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _reply_anchor_priority_clause(message: Any) -> str:
+    """Extra auto-continue guidance when the new turn has explicit reply context."""
+    text = str(message or "").lstrip()
+    if not text.startswith('[Replying to: "'):
+        return ""
+    return (
+        " Treat the latest quoted/reply target as the primary anchor. "
+        "If older interrupted tool results are about another topic, treat them as background "
+        "and answer the quoted target first."
+    )
+
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -13093,7 +13105,7 @@ class GatewayRunner:
                     f"by {_reason_phrase}. The conversation history below is intact. "
                     f"If it contains unfinished tool result(s), process them first and "
                     f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
+                    f"message below.{_reply_anchor_priority_clause(message)}]\n\n"
                     + message
                 )
             elif _has_fresh_tool_tail:
@@ -13102,7 +13114,7 @@ class GatewayRunner:
                     "process the last tool result(s). The conversation history contains "
                     "tool outputs you haven't responded to yet. Please finish processing "
                     "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    f"user's new message below.{_reply_anchor_priority_clause(message)}]\n\n"
                     + message
                 )
 
