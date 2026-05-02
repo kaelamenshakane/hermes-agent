@@ -2061,8 +2061,15 @@ class GatewayRunner:
             logger.debug("Baldr gateway hook failed: %s", exc)
             return None
 
-    async def _baldr_status_text(self) -> Optional[str]:
+    async def _baldr_status_text(self, reply_context_text: Optional[str] = None) -> Optional[str]:
         """Return a compact Baldr control-plane snapshot for Matrix busy replies."""
+        if reply_context_text:
+            anchored = await self._baldrctl_json("status-for-text", reply_context_text, "--json", timeout=1.5)
+            if anchored:
+                reply_text = anchored.get("reply_text")
+                if isinstance(reply_text, str) and reply_text.strip():
+                    return reply_text.strip()[:1200]
+
         status = await self._baldrctl_json("status", "--json", timeout=1.5)
         if status:
             tasks = status.get("tasks") or status.get("items") or []
@@ -2107,6 +2114,7 @@ class GatewayRunner:
         lane: str,
         priority: str,
         execution: str = "answer_now",
+        reply_context_text: Optional[str] = None,
     ) -> Optional[str]:
         """Return a short local reply for Matrix busy-path control messages.
 
@@ -2130,7 +2138,7 @@ class GatewayRunner:
             "ревьювить", "косяк", "косяки",
         )
         if any(term in lowered for term in status_terms):
-            return await self._baldr_status_text()
+            return await self._baldr_status_text(reply_context_text=reply_context_text)
         if any(term in lowered for term in report_terms):
             return (
                 "Да: по завершении напишу сюда коротко — что сделал, "
@@ -2191,7 +2199,13 @@ class GatewayRunner:
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
 
         if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
-            control_text = await self._baldr_control_reply_text(text, lane, priority, execution)
+            control_text = await self._baldr_control_reply_text(
+                text,
+                lane,
+                priority,
+                execution,
+                reply_context_text=route_text if reply_text else None,
+            )
             if control_text:
                 await adapter._send_with_retry(
                     chat_id=event.source.chat_id,
@@ -2200,22 +2214,19 @@ class GatewayRunner:
                     metadata=thread_meta,
                 )
                 return True
-
         if execution in {"background", "delegate"} and lane in {"code", "research", "finalempire", "cheap"}:
-            bg_prompt = (
-                "Baldr routed this Matrix message while the main session was busy. "
-                f"Lane: {lane}; priority: {priority}. Respond in concise Russian.\n\n"
-                f"User message: {text}"
+            # Do not auto-convert Matrix busy messages into visible /background
+            # runs. That caused noisy "Background task started/complete" replies
+            # to overtake newer user messages, while the original questions still
+            # looked missed. Fall through to the normal busy queue so ordering is
+            # preserved and a queued follow-up processes the user's exact message.
+            logger.info(
+                "Baldr busy-route chose %s/%s for Matrix session %s; preserving order via busy queue instead of visible background task.",
+                lane,
+                execution,
+                session_key,
             )
-            routed_event = dataclasses.replace(event, text=f"/background {bg_prompt}")
-            ack = await self._handle_background_command(routed_event)
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=ack,
-                reply_to=event.message_id,
-                metadata=thread_meta,
-            )
-            return True
+            return False
 
         return False
 
