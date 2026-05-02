@@ -716,6 +716,68 @@ class TestBusySessionOnboardingHint:
         assert "matrix-parallelism-busy-control" not in content
 
     @pytest.mark.asyncio
+    async def test_baldr_status_text_surfaces_timeline_and_insight_cards(self, monkeypatch):
+        """Host-health style status JSON should surface summary, timeline, and top insight cards."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args == ("status", "--json"):
+                return {
+                    "summary": "host-health surface draft ready",
+                    "timeline": [
+                        {
+                            "summary": "worker snapshot rechecked",
+                            "evidence_path": "/srv/agent/state/reports/host-health.md",
+                        }
+                    ],
+                    "insight_cards": [
+                        {
+                            "severity": "warning",
+                            "title": "Router freshness stale",
+                            "cause": "worker snapshot is 19m old",
+                            "next_action": "refresh supervisor sample",
+                            "user_action_required": False,
+                        },
+                        {
+                            "severity": "blocked",
+                            "title": "Bell approval needed",
+                            "cause": "candidate standard cannot auto-promote",
+                            "next_action": "Нужен bell: approve/edit/drop candidate",
+                            "user_action_required": True,
+                        },
+                        {
+                            "severity": "info",
+                            "title": "Cheap lane healthy",
+                            "cause": "cheap summarizer fallback ready",
+                            "next_action": "keep external default for code work",
+                            "user_action_required": False,
+                        },
+                        {
+                            "severity": "critical",
+                            "title": "Should be trimmed",
+                            "cause": "only top 3 cards should surface",
+                            "next_action": "ignore",
+                            "user_action_required": False,
+                        },
+                    ],
+                }
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+
+        content = await runner._baldr_status_text()
+
+        assert "сейчас: host-health surface draft ready" in content
+        assert "последнее: worker snapshot rechecked" in content
+        assert "/srv/agent/state/reports/host-health.md" in content
+        assert "важное: [warning] Router freshness stale" in content
+        assert "важное: [blocked] Bell approval needed" in content
+        assert "важное: [info] Cheap lane healthy" in content
+        assert "Should be trimmed" not in content
+
+    @pytest.mark.asyncio
     async def test_baldr_matrix_busy_correction_answers_immediately(self, monkeypatch):
         """Parallelism/routing corrections should be answered immediately, not queued."""
         import gateway.run as _gr

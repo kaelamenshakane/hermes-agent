@@ -2210,7 +2210,43 @@ class GatewayRunner:
                 if lines:
                     return "сейчас: " + "\n".join(lines)[:1100]
             if isinstance(status.get("summary"), str) and status["summary"].strip():
-                return "сейчас: " + status["summary"].strip()[:1100]
+                lines = ["сейчас: " + status["summary"].strip()]
+                timeline = status.get("timeline") or status.get("recent_timeline") or []
+                if isinstance(timeline, list):
+                    for item in timeline:
+                        if not isinstance(item, dict):
+                            continue
+                        detail = str(
+                            item.get("summary")
+                            or item.get("title")
+                            or item.get("label")
+                            or item.get("text")
+                            or ""
+                        ).strip()
+                        evidence = str(item.get("evidence_path") or item.get("artifact") or "").strip()
+                        if detail:
+                            if evidence:
+                                detail = f"{detail} ({evidence})"
+                            lines.append("последнее: " + detail)
+                            break
+                insight_cards = status.get("insight_cards") or status.get("insights") or []
+                if isinstance(insight_cards, list):
+                    for card in insight_cards[:3]:
+                        if not isinstance(card, dict):
+                            continue
+                        severity = str(card.get("severity") or "info").strip() or "info"
+                        title = str(card.get("title") or card.get("summary") or "").strip()
+                        cause = str(card.get("cause") or "").strip()
+                        next_action = str(card.get("next_action") or "").strip()
+                        if not title:
+                            continue
+                        text = f"важное: [{severity}] {title}"
+                        if cause:
+                            text += f" — {cause}"
+                        if next_action:
+                            text += f"; дальше: {next_action}"
+                        lines.append(text)
+                return "\n".join(lines)[:1200]
 
         script = Path("/srv/agent/scripts/baldrctl.py")
         if not script.exists():
