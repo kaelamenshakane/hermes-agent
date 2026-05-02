@@ -124,6 +124,18 @@ _SUBAGENT_TOOLSETS = sorted(
 )
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
+_TIER2_HANDOFF_PACKET_TEMPLATE = """id: <stable-task-id>
+status: active|blocked|completed
+user_intent: <one sentence>
+quote_anchor: <quoted text/image/event if relevant>
+current_artifacts:
+  - <absolute paths or URLs>
+constraints:
+  - <approval boundaries / no-go zones>
+next_action: <single concrete next step>
+needs_user: <none or exact input>
+last_verified: <UTC timestamp + command/tool/report>"""
+
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
@@ -569,6 +581,9 @@ def _build_child_system_prompt(
         "- Any issues encountered\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+        "Tier-2 handoff rule: you do NOT inherit the parent chat history. Treat the goal/context as your full durable handoff packet. If the context is partial, reconstruct a compact packet before acting and keep your work anchored to it. Use this shape:\n"
+        f"```yaml\n{_TIER2_HANDOFF_PACKET_TEMPLATE}\n```\n"
+        "Prefer absolute paths/URLs in current_artifacts, keep constraints explicit, and preserve the exact next_action or user blocker in your final summary.\n\n"
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
@@ -2377,6 +2392,7 @@ DELEGATE_TASK_SCHEMA = {
         "IMPORTANT:\n"
         "- Subagents have NO memory of your conversation. Pass all relevant "
         "info (file paths, error messages, constraints) via the 'context' field.\n"
+        "- For non-trivial delegated work, prefer a compact Tier-2 handoff packet in 'context' so the child starts from recoverable state, e.g. id/status/user_intent/current_artifacts/constraints/next_action/needs_user/last_verified.\n"
         "- If the user is writing in a non-English language, or asked for "
         "output in a specific language / tone / style, say so in 'context' "
         "(e.g. \"respond in Chinese\", \"return output in Japanese\"). "
@@ -2415,7 +2431,9 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints. The more "
+                    "error messages, project structure, constraints. For "
+                    "non-trivial delegated work, prefer a compact Tier-2 "
+                    "handoff packet here (id/status/user_intent/current_artifacts/constraints/next_action/needs_user/last_verified). The more "
                     "specific you are, the better the subagent performs."
                 ),
             },
