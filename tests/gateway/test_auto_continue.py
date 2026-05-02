@@ -18,12 +18,19 @@ def _simulate_auto_continue(agent_history: list, user_message: str) -> str:
     """
     message = user_message
     if agent_history and agent_history[-1].get("role") == "tool":
+        reply_anchor_clause = ""
+        if str(message or "").lstrip().startswith('[Replying to: "'):
+            reply_anchor_clause = (
+                " Treat the latest quoted/reply target as the primary anchor. "
+                "If older interrupted tool results are about another topic, treat them as background "
+                "and answer the quoted target first."
+            )
         message = (
             "[System note: Your previous turn was interrupted before you could "
             "process the last tool result(s). The conversation history contains "
             "tool outputs you haven't responded to yet. Please finish processing "
             "those results and summarize what was accomplished, then address the "
-            "user's new message below.]\n\n"
+            f"user's new message below.{reply_anchor_clause}]\n\n"
             + message
         )
     return message
@@ -93,3 +100,20 @@ class TestAutoDetection:
         note_end = result.index("]\n\n")
         user_msg_start = result.index("now do X")
         assert user_msg_start > note_end
+
+    def test_reply_anchor_adds_priority_guard_to_auto_continue_note(self):
+        history = [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "t", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "done"},
+        ]
+        user_message = (
+            '[Replying to: "baldr-fast-router-deep-worker-chain [ops/blocked] ... '
+            'selfhost-llm-vast-deploy [infra/blocked]"]\n\n'
+            'сравни о чем твой пост и на что он реагирует и вычлени ошибку'
+        )
+
+        result = _simulate_auto_continue(history, user_message)
+
+        assert "quoted/reply target as the primary anchor" in result

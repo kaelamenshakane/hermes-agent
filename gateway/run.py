@@ -232,6 +232,18 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _reply_anchor_priority_clause(message: Any) -> str:
+    """Extra auto-continue guidance when the new turn has explicit reply context."""
+    text = str(message or "").lstrip()
+    if not text.startswith('[Replying to: "'):
+        return ""
+    return (
+        " Treat the latest quoted/reply target as the primary anchor. "
+        "If older interrupted tool results are about another topic, treat them as background "
+        "and answer the quoted target first."
+    )
+
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -2033,6 +2045,412 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _baldr_gateway_router_enabled(self) -> bool:
+        """Return whether the local Baldr busy-router hook should run.
+
+        The hook is fail-open: errors/timeouts fall back to the existing
+        busy-input behavior.  It is Matrix-only in the call site below.
+        """
+        raw = os.environ.get("BALDR_GATEWAY_HOOK_ENABLED", "true")
+        return raw.lower() not in {"0", "false", "no", "off"}
+
+    def _append_baldr_route_event(self, payload: Dict[str, Any]) -> None:
+        """Append a durable Baldr route event for busy-path routing decisions.
+
+        This is intentionally fail-open: routing must continue even if the
+        durable event log is unavailable.
+        """
+        path_raw = os.environ.get(
+            "BALDR_ROUTE_EVENTS_PATH",
+            "/srv/agent/state/baldr-route-events.jsonl",
+        )
+        try:
+            path = Path(path_raw).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            event = dict(payload or {})
+            event.setdefault(
+                "env",
+                (os.environ.get("BALDR_ROUTE_EVENT_ENV", "live") or "live").strip().lower(),
+            )
+            event.setdefault(
+                "timestamp_utc",
+                datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            )
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception as exc:
+            logger.debug("Baldr route event append failed: %s", exc)
+
+    async def _baldrctl_json(self, *args: str, timeout: float = 1.5) -> Optional[Dict[str, Any]]:
+        allowed_commands = {
+            ("route", 2),
+            ("status", 2),
+            ("status-for-text", 3),
+        }
+        command = str(args[0]).strip() if args else ""
+        command_key = (command, len(args))
+        if command_key not in allowed_commands:
+            logger.debug("Baldr gateway hook rejected non-allowlisted command: %s", args)
+            return None
+
+        script = Path("/srv/agent/scripts/baldrctl.py")
+        if not script.exists():
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0 or not stdout:
+                return None
+            return json.loads(stdout.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            logger.debug("Baldr gateway hook failed: %s", exc)
+            return None
+
+    async def _baldr_enqueue_link_review(
+        self,
+        event: MessageEvent,
+        *,
+        reply_anchor_text: Optional[str] = None,
+        timeout: float = 1.5,
+    ) -> Optional[Dict[str, Any]]:
+        """Durably enqueue URL-bearing Matrix text for later link safety review.
+
+        Fail-open: if the helper is unavailable or the text has no URLs, busy-path
+        routing should continue normally without surfacing an error to the user.
+        """
+        script = Path("/srv/agent/scripts/baldr-link-review-queue.py")
+        if not script.exists():
+            return None
+
+        text = (event.text or "").strip()
+        if not text:
+            return None
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                "enqueue",
+                "--text",
+                text,
+                "--source",
+                "matrix",
+                "--message-id",
+                str(event.message_id or ""),
+                "--chat-id",
+                str(event.source.chat_id or ""),
+                "--sender",
+                str(getattr(event.source, "user_name", None) or getattr(event.source, "user_id", None) or ""),
+                "--reply-anchor-text",
+                str(reply_anchor_text or ""),
+                "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0 or not stdout:
+                return None
+            payload = json.loads(stdout.decode("utf-8", errors="replace"))
+            item = payload.get("item") if isinstance(payload, dict) else None
+            return item if isinstance(item, dict) else None
+        except Exception as exc:
+            logger.debug("Baldr link-review enqueue failed for %s: %s", event.message_id or "?", exc)
+            return None
+
+    async def _maybe_enqueue_baldr_cold_link_review(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Fail-open cold-path enqueue for non-busy Matrix URL intake.
+
+        This mirrors the busy-path durable queue handoff so bell's regular Matrix
+        messages with links are reviewable even when no active session is busy.
+        Commands and non-text messages are ignored.
+        """
+        if not self._baldr_gateway_router_enabled():
+            return None
+        if event.source.platform != Platform.MATRIX:
+            return None
+        if event.message_type != MessageType.TEXT:
+            return None
+        text = (event.text or "").strip()
+        if not text or event.is_command():
+            return None
+        return await self._baldr_enqueue_link_review(
+            event,
+            reply_anchor_text=str(getattr(event, "reply_to_text", None) or "")[:500] or None,
+        )
+
+    async def _baldr_status_text(self, reply_context_text: Optional[str] = None) -> Optional[str]:
+        """Return a compact Baldr control-plane snapshot for Matrix busy replies."""
+        if reply_context_text:
+            anchored = await self._baldrctl_json("status-for-text", reply_context_text, "--json", timeout=1.5)
+            if anchored:
+                reply_text = anchored.get("reply_text")
+                if isinstance(reply_text, str) and reply_text.strip():
+                    return reply_text.strip()[:1200]
+
+        status = await self._baldrctl_json("status", "--json", timeout=1.5)
+        if status:
+            tasks = status.get("tasks") or status.get("items") or []
+            if isinstance(tasks, list) and tasks:
+                lines = []
+                for task in tasks[:5]:
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = str(task.get("id") or task.get("task_id") or "task")
+                    lane = str(task.get("lane") or "?")
+                    state = str(task.get("status") or task.get("state") or "?")
+                    summary = str(task.get("summary") or task.get("title") or task.get("content") or "").strip()
+                    text = f"{task_id} [{lane}/{state}]"
+                    if summary:
+                        text = f"{text} — {summary}"
+                    lines.append(text)
+                if lines:
+                    return "сейчас: " + "\n".join(lines)[:1100]
+            if isinstance(status.get("summary"), str) and status["summary"].strip():
+                lines = ["сейчас: " + status["summary"].strip()]
+                timeline = status.get("timeline") or status.get("recent_timeline") or []
+                if isinstance(timeline, list):
+                    for item in timeline:
+                        if not isinstance(item, dict):
+                            continue
+                        detail = str(
+                            item.get("summary")
+                            or item.get("title")
+                            or item.get("label")
+                            or item.get("text")
+                            or ""
+                        ).strip()
+                        evidence = str(item.get("evidence_path") or item.get("artifact") or "").strip()
+                        if detail:
+                            if evidence:
+                                detail = f"{detail} ({evidence})"
+                            lines.append("последнее: " + detail)
+                            break
+                insight_cards = status.get("insight_cards") or status.get("insights") or []
+                if isinstance(insight_cards, list):
+                    for card in insight_cards[:3]:
+                        if not isinstance(card, dict):
+                            continue
+                        severity = str(card.get("severity") or "info").strip() or "info"
+                        title = str(card.get("title") or card.get("summary") or "").strip()
+                        cause = str(card.get("cause") or "").strip()
+                        next_action = str(card.get("next_action") or "").strip()
+                        if not title:
+                            continue
+                        text = f"важное: [{severity}] {title}"
+                        if cause:
+                            text += f" — {cause}"
+                        if next_action:
+                            text += f"; дальше: {next_action}"
+                        lines.append(text)
+                return "\n".join(lines)[:1200]
+
+        script = Path("/srv/agent/scripts/baldrctl.py")
+        if not script.exists():
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                "snapshot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.5)
+            if proc.returncode == 0 and stdout:
+                return stdout.decode("utf-8", errors="replace").strip()[:1200]
+        except Exception as exc:
+            logger.debug("Baldr status snapshot failed: %s", exc)
+        return None
+
+    async def _baldr_control_reply_text(
+        self,
+        text: str,
+        lane: str,
+        priority: str,
+        execution: str = "answer_now",
+        reply_context_text: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return a short local reply for Matrix busy-path control messages.
+
+        This intentionally avoids an LLM call: while the main session is busy,
+        bell still needs direct answers to control/status/correction messages.
+        Unknown content falls back to normal queue behavior.
+        """
+        lowered = text.lower()
+        status_terms = (
+            "что делаешь", "что ты делаешь", "что сейчас", "что там",
+            "чотам", "че там", "чё там",
+            "почему молч", "статус", "жду", "сам работаешь",
+        )
+        report_terms = (
+            "что напишешь", "как сделаешь", "когда законч", "как сделаешь все",
+        )
+        correction_terms = (
+            "параллелизм", "паралеллизм", "паралелизм",
+            "параллель", "паралель", "параллел", "паралел",
+            "не отвечаешь", "других линиях", "другие линии",
+            "ревьювить", "косяк", "косяки",
+        )
+        if any(term in lowered for term in status_terms):
+            return await self._baldr_status_text(reply_context_text=reply_context_text)
+        if any(term in lowered for term in report_terms):
+            return (
+                "Да: по завершении напишу сюда коротко — что сделал, "
+                "что проверил, где результат, и что осталось/заблокировано."
+            )
+        if lane in {"ops", "control"} and any(term in lowered for term in correction_terms):
+            return (
+                "Принял. Это не должно ждать очереди: ревью параллелизма/Matrix routing "
+                "приоритетнее текущей работы. Фикс: busy-control отвечать сразу, "
+                "остальное — в worker/background, не в молчаливую очередь."
+            )
+        if lane == "ops" and priority == "urgent":
+            return "Принял как urgent ops. Остановлю обычную очередь и разберу доступ/Matrix/gateway первым."
+        if lane == "control" and execution == "answer_now":
+            # Do not emit generic filler for unknown control messages. If the
+            # local router cannot produce a concrete status/action reply, let
+            # the normal queue path handle the message instead.
+            return None
+        return None
+
+    @staticmethod
+    def _baldr_should_interrupt_busy_turn(text: str, lane: str, priority: str) -> bool:
+        """True when a Matrix busy-path control message supersedes current work.
+
+        For bell, `answer_now` alone is insufficient: urgent corrections must
+        also stop the active turn, otherwise the old turn can continue mutating
+        state after the correction was acknowledged.
+        """
+        lowered = (text or "").lower()
+        if lane not in {"control", "ops"}:
+            return False
+        supersede_terms = (
+            "параллелизм", "паралеллизм", "паралелизм",
+            "параллель", "паралель", "не отвечаешь",
+            "не туда", "не так", "неправил", "косяк", "косяки",
+            "наделал", "исправляй", "чини", "почини",
+            "запомни", "запиши себе", "не лезь", "не трогай",
+            "останов", "хватит", "стоп", "отмени", "срочно",
+            "сломал", "не работает", "доступ потерян", "крит",
+        )
+        if any(term in lowered for term in supersede_terms):
+            return True
+        return priority == "urgent" and any(
+            term in lowered for term in ("ops", "urgent", "важно", "сейчас")
+        )
+
+    async def _maybe_handle_baldr_busy_route(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        adapter: Any,
+    ) -> bool:
+        """Matrix busy-path pre-router for Baldr.
+
+        When the main Matrix session is busy, route status questions to the
+        durable Baldr registry and route independent long work through the
+        existing /background mechanism instead of steering everything into the
+        current chat run.
+        """
+        if not self._baldr_gateway_router_enabled():
+            return False
+        if event.source.platform != Platform.MATRIX:
+            return False
+        if event.message_type != MessageType.TEXT:
+            return False
+        text = (event.text or "").strip()
+        if not text or event.is_command():
+            return False
+
+        route_text = text
+        reply_text = getattr(event, "reply_to_text", None)
+        if reply_text:
+            # Reply context is the primary anchor for bell's short Matrix replies
+            # like "а это?", "почему?", "так и не ответил".
+            route_text = f'[Replying to: "{str(reply_text)[:500]}"]\n\n{text}'
+
+        decision = await self._baldrctl_json("route", route_text, timeout=1.5)
+        if not decision:
+            return False
+
+        lane = str(decision.get("lane") or "control")
+        execution = str(decision.get("execution") or "answer_now")
+        priority = str(decision.get("priority") or "normal")
+        should_interrupt = self._baldr_should_interrupt_busy_turn(text, lane, priority)
+        link_review_item = await self._baldr_enqueue_link_review(
+            event,
+            reply_anchor_text=str(reply_text)[:500] if reply_text else None,
+        )
+        route_event = {
+            "source": "matrix-busy-router",
+            "session_key": session_key,
+            "chat_id": event.source.chat_id,
+            "message_id": event.message_id,
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "reply_anchor_text": str(reply_text)[:500] if reply_text else None,
+            "user_text": text[:1000],
+            "route_text": route_text[:1500],
+            "lane": lane,
+            "priority": priority,
+            "execution": execution,
+            "target_task_id": decision.get("task_id") or decision.get("target_task_id"),
+            "target_worker": decision.get("target_worker") or decision.get("worker"),
+            "should_interrupt": should_interrupt,
+            "link_review_queue_id": link_review_item.get("id") if isinstance(link_review_item, dict) else None,
+        }
+        self._append_baldr_route_event(route_event)
+        thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+
+        if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
+            control_text = await self._baldr_control_reply_text(
+                text,
+                lane,
+                priority,
+                execution,
+                reply_context_text=route_text if reply_text else None,
+            )
+            if control_text:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=control_text,
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                if should_interrupt:
+                    running_agent = self._running_agents.get(session_key)
+                    if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                        try:
+                            running_agent.interrupt(text)
+                            logger.info(
+                                "Baldr Matrix busy correction interrupted active turn for session %s",
+                                session_key or "?",
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Baldr busy correction could not interrupt active turn for session %s: %s",
+                                session_key or "?",
+                                exc,
+                            )
+                return True
+        if execution in {"background", "delegate"} and lane in {"code", "research", "finalempire", "cheap"}:
+            # Do not auto-convert Matrix busy messages into visible /background
+            # runs. That caused noisy "Background task started/complete" replies
+            # to overtake newer user messages, while the original questions still
+            # looked missed. Fall through to the normal busy queue so ordering is
+            # preserved and a queued follow-up processes the user's exact message.
+            logger.info(
+                "Baldr busy-route chose %s/%s for Matrix session %s; preserving order via busy queue instead of visible background task.",
+                lane,
+                execution,
+                session_key,
+            )
+            return False
+
+        return False
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -2075,6 +2493,15 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
+
+        # Baldr Matrix pre-router: answer status questions immediately and route
+        # independent long work to /background instead of injecting everything
+        # into the active chat run.  Fail-open to existing busy behavior.
+        try:
+            if await self._maybe_handle_baldr_busy_route(event, session_key, adapter):
+                return True
+        except Exception as exc:
+            logger.debug("Baldr busy-route hook fell back to default behavior: %s", exc)
 
         running_agent = self._running_agents.get(session_key)
 
@@ -4923,6 +5350,19 @@ class GatewayRunner:
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
 
+            # Baldr Matrix control/status messages must bypass the generic
+            # busy queue here as well as in the adapter busy-handler path.
+            # This catches follow-ups that arrive while _handle_message sees
+            # _running_agents directly; otherwise `чотам` can sit behind the
+            # previous turn until final stream delivery/queue drain finishes.
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                try:
+                    if await self._maybe_handle_baldr_busy_route(event, _quick_key, adapter):
+                        return None
+                except Exception as exc:
+                    logger.debug("Baldr priority-route hook fell back to default behavior: %s", exc)
+
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self.adapters.get(source.platform)
@@ -5015,6 +5455,8 @@ class GatewayRunner:
 
         # Check for commands
         command = event.get_command()
+        if not command:
+            await self._maybe_enqueue_baldr_cold_link_review(event)
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
@@ -8532,6 +8974,13 @@ class GatewayRunner:
                 source=source,
                 user_config=user_config,
             )
+            background_cfg = (user_config.get("background") or {}) if isinstance(user_config, dict) else {}
+            background_model = background_cfg.get("model") or os.getenv("HERMES_BACKGROUND_MODEL")
+            background_provider = background_cfg.get("provider") or os.getenv("HERMES_BACKGROUND_PROVIDER")
+            if background_model:
+                model = str(background_model)
+            if background_provider:
+                runtime_kwargs["provider"] = str(background_provider)
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -12715,7 +13164,7 @@ class GatewayRunner:
                     f"by {_reason_phrase}. The conversation history below is intact. "
                     f"If it contains unfinished tool result(s), process them first and "
                     f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
+                    f"message below.{_reply_anchor_priority_clause(message)}]\n\n"
                     + message
                 )
             elif _has_fresh_tool_tail:
@@ -12724,7 +13173,7 @@ class GatewayRunner:
                     "process the last tool result(s). The conversation history contains "
                     "tool outputs you haven't responded to yet. Please finish processing "
                     "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    f"user's new message below.{_reply_anchor_priority_clause(message)}]\n\n"
                     + message
                 )
 
@@ -13317,9 +13766,46 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+            # Baldr Matrix control/ops answer_now fast path for messages that
+            # already reached the pending queue. These must not wait behind
+            # final stream confirmation / first-response resend before being
+            # answered. The hook is fail-open: on errors, normal queued
+            # follow-up handling below still applies.
+            if pending_event is not None and adapter is not None:
+                try:
+                    if await self._maybe_handle_baldr_busy_route(
+                        pending_event,
+                        session_key,
+                        adapter,
+                    ):
+                        logger.info(
+                            "Handled pending Baldr Matrix control event immediately for session %s",
+                            session_key or "?",
+                        )
+                        pending_event = None
+                        pending = None
+
+                        next_pending_event = _dequeue_pending_event(adapter, session_key)
+                        next_pending_event = self._promote_queued_event(
+                            session_key,
+                            adapter,
+                            next_pending_event,
+                        )
+                        if next_pending_event is not None:
+                            pending_event = next_pending_event
+                            pending = (
+                                next_pending_event.text
+                                or _build_media_placeholder(next_pending_event)
+                            )
+                except Exception as exc:
+                    logger.debug(
+                        "Pending Baldr busy-route hook fell back to queued follow-up behavior: %s",
+                        exc,
+                    )
+
             if self._draining and (pending_event or pending):
                 logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
+                    "Discarding non-control pending follow-up for session %s during gateway %s",
                     session_key or "?",
                     self._status_action_label(),
                 )

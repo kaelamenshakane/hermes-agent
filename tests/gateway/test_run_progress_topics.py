@@ -747,8 +747,9 @@ async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path):
+async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path, caplog):
     QueuedCommentaryAgent.calls = 0
+    caplog.set_level("INFO")
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -761,7 +762,12 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     sent_texts = [call["content"] for call in adapter.sent]
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
-    assert "final response 1" in sent_texts
+    assert sent_texts[-1] == "final response 1"
+    assert any(
+        "Queued follow-up for session" in record.message
+        and "final stream delivery not confirmed" in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

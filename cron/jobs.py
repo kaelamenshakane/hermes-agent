@@ -480,9 +480,10 @@ def create_job(
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
-    # Default delivery to origin if available, otherwise local
+    # Baldr/bell policy: autonomous cron jobs are silent/local by default.
+    # Chat delivery must be explicit; routine workers must not spam Matrix.
     if deliver is None:
-        deliver = "origin" if origin else "local"
+        deliver = "local"
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()

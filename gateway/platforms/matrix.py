@@ -1601,6 +1601,125 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return body, is_dm, chat_type, thread_id, display_name, source
 
+    @staticmethod
+    def _extract_reply_fallback_text(body: str) -> Optional[str]:
+        """Extract the quoted Matrix reply fallback text from a message body.
+
+        Matrix clients include a plaintext fallback for replies, e.g.:
+        ``> <@alice:example.org> Original\n> second line\n\nActual reply``.
+        We already strip that fallback from the user message; keeping it as
+        ``reply_to_text`` lets the gateway inject explicit context for the LLM.
+        """
+        if not body or not body.startswith("> "):
+            return None
+
+        quoted: list[str] = []
+        for line in body.split("\n"):
+            if line.startswith("> "):
+                quoted.append(line[2:])
+                continue
+            if line == ">":
+                quoted.append("")
+                continue
+            if line == "":
+                break
+            break
+
+        while quoted and quoted[-1] == "":
+            quoted.pop()
+        if not quoted:
+            return None
+
+        # Matrix fallback convention prefixes the first quoted line with the
+        # sender display name / MXID. Remove only the obvious ``<...>`` form.
+        first = quoted[0]
+        if first.startswith("<") and "> " in first:
+            quoted[0] = first.split("> ", 1)[1]
+
+        text = "\n".join(quoted).strip()
+        return MatrixAdapter._normalize_reply_context_text(text)
+
+    @staticmethod
+    def _strip_matrix_reply_fallback(body: str) -> str:
+        """Remove Matrix plaintext reply fallback from ``body`` if present."""
+        if not body or not body.startswith("> "):
+            return body
+
+        lines = body.split("\n")
+        stripped: list[str] = []
+        past_fallback = False
+        for line in lines:
+            if not past_fallback:
+                if line.startswith("> ") or line == ">":
+                    continue
+                if line == "":
+                    past_fallback = True
+                    continue
+                past_fallback = True
+            stripped.append(line)
+        return "\n".join(stripped) if stripped else body
+
+    @staticmethod
+    def _normalize_reply_context_text(text: str) -> Optional[str]:
+        """Normalize fetched/quoted parent text before gateway injection.
+
+        Matrix replies can quote a Hermes message that already starts with our
+        synthetic ``[Replying to: "..."]`` prefix. In a chain, that older prefix
+        becomes stale context and can make the next turn answer the wrong target.
+        Keep the direct parent body, but drop Matrix fallback and leading
+        synthetic reply-context blocks.
+        """
+        if not text:
+            return None
+
+        text = MatrixAdapter._strip_matrix_reply_fallback(str(text)).strip()
+        prefix = '[Replying to: "'
+        while text.startswith(prefix):
+            marker_index = text.find('"]')
+            if marker_index < 0:
+                break
+            text = text[marker_index + 2 :].lstrip()
+        return text.strip() or None
+
+    @staticmethod
+    def _event_content_dict(event: Any) -> dict:
+        content = getattr(event, "content", None)
+        if isinstance(content, dict):
+            return content
+        if hasattr(content, "serialize"):
+            try:
+                return content.serialize() or {}
+            except Exception:
+                return {}
+        return {}
+
+    async def _fetch_event_text(self, room_id: str, event_id: str) -> Optional[str]:
+        """Fetch text/body for a Matrix event ID for reply-context injection."""
+        if not event_id or not self._client or not hasattr(self._client, "get_event"):
+            return None
+        try:
+            event = await self._client.get_event(RoomID(room_id), EventID(event_id))
+        except Exception as exc:
+            logger.debug(
+                "Matrix: failed to fetch replied-to event %s in %s: %s",
+                event_id,
+                room_id,
+                exc,
+            )
+            return None
+
+        content = self._event_content_dict(event)
+        msgtype = str(content.get("msgtype", ""))
+        body = str(content.get("body", "") or "").strip()
+        if not body:
+            return None
+        if msgtype in ("m.text", "m.notice", "m.emote"):
+            return self._normalize_reply_context_text(body)
+        if msgtype.startswith("m."):
+            normalized = self._normalize_reply_context_text(body) or body
+            return f"[{msgtype}] {normalized}"
+        return self._normalize_reply_context_text(body)
+
     async def _handle_text_message(
         self,
         room_id: str,
@@ -1633,21 +1752,15 @@ class MatrixAdapter(BasePlatformAdapter):
         if in_reply_to:
             reply_to = in_reply_to.get("event_id")
 
+        reply_to_text = None
+        if reply_to:
+            reply_to_text = self._extract_reply_fallback_text(body)
+            if not reply_to_text:
+                reply_to_text = await self._fetch_event_text(room_id, reply_to)
+
         # Strip reply fallback from body.
         if reply_to and body.startswith("> "):
-            lines = body.split("\n")
-            stripped = []
-            past_fallback = False
-            for line in lines:
-                if not past_fallback:
-                    if line.startswith("> ") or line == ">":
-                        continue
-                    if line == "":
-                        past_fallback = True
-                        continue
-                    past_fallback = True
-                stripped.append(line)
-            body = "\n".join(stripped) if stripped else body
+            body = self._strip_matrix_reply_fallback(body)
 
         msg_type = MessageType.TEXT
         if body.startswith(("!", "/")):
@@ -1660,6 +1773,7 @@ class MatrixAdapter(BasePlatformAdapter):
             raw_message=source_content,
             message_id=event_id,
             reply_to_message_id=reply_to,
+            reply_to_text=reply_to_text,
         )
 
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:

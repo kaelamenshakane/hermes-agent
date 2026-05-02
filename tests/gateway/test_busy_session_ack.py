@@ -4,6 +4,8 @@ Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
 import asyncio
+import os
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,6 +31,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    Platform,
     SessionSource,
     build_session_key,
 )
@@ -40,8 +43,9 @@ from gateway.platforms.base import (
 
 def _make_event(text="hello", chat_id="123", platform_val="telegram"):
     """Build a minimal MessageEvent."""
+    platform = platform_val if hasattr(platform_val, "value") else MagicMock(value=platform_val)
     source = SessionSource(
-        platform=MagicMock(value=platform_val),
+        platform=platform,
         chat_id=chat_id,
         chat_type="private",
         user_id="user1",
@@ -57,6 +61,7 @@ def _make_event(text="hello", chat_id="123", platform_val="telegram"):
 
 def _make_runner():
     """Build a minimal GatewayRunner-like object for testing."""
+    os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = "true"
     from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 
     runner = object.__new__(GatewayRunner)
@@ -85,6 +90,12 @@ def _make_adapter(platform_val="telegram"):
     adapter.config.extra = {}
     adapter.platform = MagicMock(value=platform_val)
     return adapter
+
+
+@pytest.fixture(autouse=True)
+def _isolated_baldr_route_events(monkeypatch, tmp_path):
+    monkeypatch.setenv("BALDR_ROUTE_EVENTS_PATH", str(tmp_path / "baldr-route-events.jsonl"))
+    monkeypatch.setenv("BALDR_ROUTE_EVENT_ENV", "test")
 
 
 # ---------------------------------------------------------------------------
@@ -552,3 +563,752 @@ class TestBusySessionOnboardingHint:
         assert "/busy interrupt" in content
         # Must NOT tell the user to /busy queue when they're already on queue.
         assert "/busy queue" not in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_status_answers_immediately(self, monkeypatch):
+        """Bell's Matrix status/control questions should not wait in queue."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="а что именно ты щас делаешь чтоя жду", platform_val=Platform.MATRIX)
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "control", "execution": "answer_now", "priority": "high"}
+            if args == ("status", "--json"):
+                return {"tasks": [{"id": "apk", "lane": "code", "status": "active", "summary": "собираю Android APK"}]}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        mock_merge.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "сейчас:" in content
+        assert "собираю Android APK" in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_chotam_answers_in_priority_guard(self, monkeypatch):
+        """Matrix `чотам` follow-ups must bypass _handle_message's direct busy queue."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="чотам", platform_val=Platform.MATRIX)
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "control", "execution": "answer_now", "priority": "normal"}
+            if args == ("status", "--json"):
+                return {"tasks": [{"id": "matrix-parallelism-busy-control", "lane": "ops", "status": "active", "summary": "чиню quick replies"}]}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await _gr.GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        mock_merge.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "сейчас:" in content
+        assert "quick replies" in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_reply_chotam_anchors_status_to_replied_topic(self, monkeypatch):
+        """Reply-context `чотам` should use the replied topic, not the global task dump."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="чотам", platform_val=Platform.MATRIX)
+        event.reply_to_text = "чотам по более дешевым за крипту для селфхоста"
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        routed_text = '[Replying to: "чотам по более дешевым за крипту для селфхоста"]\n\nчотам'
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                assert args[1] == routed_text
+                return {"lane": "control", "execution": "answer_now", "priority": "high"}
+            if args == ("status-for-text", routed_text, "--json"):
+                return {
+                    "task_id": "selfhost-llm-crypto-vps",
+                    "reply_text": "сейчас: selfhost-llm-crypto-vps [infra/completed] — live Vast shortlist ready\nпоследнее: Vast offer 20299950 shortlisted\nдальше: дождаться approve на реальный deploy",
+                }
+            if args == ("status", "--json"):
+                return {
+                    "tasks": [
+                        {"id": "matrix-parallelism-busy-control", "lane": "ops", "status": "active", "summary": "чиню quick replies"}
+                    ]
+                }
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        mock_merge.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "selfhost-llm-crypto-vps" in content
+        assert "Vast offer 20299950" in content
+        assert "matrix-parallelism-busy-control" not in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_reply_chotam_anchors_status_in_priority_guard(self, monkeypatch):
+        """Reply-context `чотам` should stay anchored even on _handle_message's direct busy path."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="чотам", platform_val=Platform.MATRIX)
+        event.reply_to_text = "чотам по более дешевым за крипту для селфхоста"
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        routed_text = '[Replying to: "чотам по более дешевым за крипту для селфхоста"]\n\nчотам'
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                assert args[1] == routed_text
+                return {"lane": "control", "execution": "answer_now", "priority": "high"}
+            if args == ("status-for-text", routed_text, "--json"):
+                return {
+                    "task_id": "selfhost-llm-crypto-vps",
+                    "reply_text": "сейчас: selfhost-llm-crypto-vps [infra/completed] — live Vast shortlist ready\nпоследнее: Vast offer 20299950 shortlisted\nдальше: дождаться approve на реальный deploy",
+                }
+            if args == ("status", "--json"):
+                return {
+                    "tasks": [
+                        {"id": "matrix-parallelism-busy-control", "lane": "ops", "status": "active", "summary": "чиню quick replies"}
+                    ]
+                }
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await _gr.GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        mock_merge.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "selfhost-llm-crypto-vps" in content
+        assert "Vast offer 20299950" in content
+        assert "matrix-parallelism-busy-control" not in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_status_text_surfaces_timeline_and_insight_cards(self, monkeypatch):
+        """Host-health style status JSON should surface summary, timeline, and top insight cards."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args == ("status", "--json"):
+                return {
+                    "summary": "host-health surface draft ready",
+                    "timeline": [
+                        {
+                            "summary": "worker snapshot rechecked",
+                            "evidence_path": "/srv/agent/state/reports/host-health.md",
+                        }
+                    ],
+                    "insight_cards": [
+                        {
+                            "severity": "warning",
+                            "title": "Router freshness stale",
+                            "cause": "worker snapshot is 19m old",
+                            "next_action": "refresh supervisor sample",
+                            "user_action_required": False,
+                        },
+                        {
+                            "severity": "blocked",
+                            "title": "Bell approval needed",
+                            "cause": "candidate standard cannot auto-promote",
+                            "next_action": "Нужен bell: approve/edit/drop candidate",
+                            "user_action_required": True,
+                        },
+                        {
+                            "severity": "info",
+                            "title": "Cheap lane healthy",
+                            "cause": "cheap summarizer fallback ready",
+                            "next_action": "keep external default for code work",
+                            "user_action_required": False,
+                        },
+                        {
+                            "severity": "critical",
+                            "title": "Should be trimmed",
+                            "cause": "only top 3 cards should surface",
+                            "next_action": "ignore",
+                            "user_action_required": False,
+                        },
+                    ],
+                }
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+
+        content = await runner._baldr_status_text()
+
+        assert "сейчас: host-health surface draft ready" in content
+        assert "последнее: worker snapshot rechecked" in content
+        assert "/srv/agent/state/reports/host-health.md" in content
+        assert "важное: [warning] Router freshness stale" in content
+        assert "важное: [blocked] Bell approval needed" in content
+        assert "важное: [info] Cheap lane healthy" in content
+        assert "Should be trimmed" not in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_correction_answers_immediately(self, monkeypatch):
+        """Parallelism/routing corrections should be answered immediately, not queued."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(
+            text="тебе опять надо ревьювить твой параллелизм. ты не отвечаешь в других линиях",
+            platform_val=Platform.MATRIX,
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "ops", "execution": "answer_now", "priority": "urgent"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        mock_merge.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "не должно ждать очереди" in content
+        assert "busy-control" in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_correction_interrupts_active_turn(self, monkeypatch):
+        """Urgent Matrix corrections should ack immediately and stop stale work."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val=Platform.MATRIX)
+        event = _make_event(
+            text="запиши себе: не лезь в код, ты наделал косяк",
+            chat_id="!room:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+        sk = build_session_key(event.source)
+        running_agent = MagicMock()
+        runner._busy_input_mode = "queue"
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "ops", "execution": "answer_now", "priority": "urgent"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        adapter._send_with_retry.assert_awaited_once()
+        running_agent.interrupt.assert_called_once_with(event.text)
+        mock_merge.assert_not_called()
+
+    def test_append_baldr_route_event_marks_test_env(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        path = tmp_path / "route-events.jsonl"
+        os.environ["BALDR_ROUTE_EVENTS_PATH"] = str(path)
+        os.environ["BALDR_ROUTE_EVENT_ENV"] = "test"
+
+        GatewayRunner._append_baldr_route_event(runner, {"source": "matrix-busy-router", "message_id": "msg1"})
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        item = __import__("json").loads(lines[0])
+        assert item["env"] == "test"
+        assert item["source"] == "matrix-busy-router"
+
+    @pytest.mark.asyncio
+    async def test_baldrctl_json_rejects_non_allowlisted_command(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        create_subprocess = AsyncMock()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+        result = await GatewayRunner._baldrctl_json(runner, "workers", "--json")
+
+        assert result is None
+        create_subprocess.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_baldr_enqueue_link_review_passes_matrix_metadata(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        event = _make_event(
+            text="посмотри https://example.com/path?q=1",
+            chat_id="!baldr:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+        event.source.user_name = "bell"
+        event.reply_to_text = "это безопасно?"
+        captured = {}
+
+        class DummyProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b'{"queued": true, "item": {"id": "link-review-123"}}', b"")
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return DummyProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+        item = await GatewayRunner._baldr_enqueue_link_review(
+            runner,
+            event,
+            reply_anchor_text=event.reply_to_text,
+        )
+
+        assert item == {"id": "link-review-123"}
+        assert captured["args"][:10] == (
+            "/srv/agent/scripts/baldr-link-review-queue.py",
+            "enqueue",
+            "--text",
+            "посмотри https://example.com/path?q=1",
+            "--source",
+            "matrix",
+            "--message-id",
+            "msg1",
+            "--chat-id",
+            "!baldr:matrix.org",
+        )
+
+    @pytest.mark.asyncio
+    async def test_baldr_cold_matrix_url_message_enqueues_link_review_before_dispatch(self, monkeypatch):
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._detect_stale_code = MagicMock(return_value=False)
+        runner._busy_input_mode = "queue"
+        runner._draining = True
+        runner._queue_during_drain_enabled = MagicMock(return_value=False)
+        runner._status_action_gerund = MagicMock(return_value="restarting")
+        event = _make_event(
+            text="проверь https://example.com/suspicious",
+            chat_id="!baldr:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+
+        called = {}
+
+        async def fake_enqueue(self, evt):
+            called["event"] = evt
+            raise RuntimeError("cold-link-enqueue-called")
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_maybe_enqueue_baldr_cold_link_review", fake_enqueue)
+
+        with pytest.raises(RuntimeError, match="cold-link-enqueue-called"):
+            await _gr.GatewayRunner._handle_message(runner, event)
+
+        assert called["event"] is event
+
+    @pytest.mark.asyncio
+    async def test_baldr_cold_matrix_command_skips_link_review_enqueue(self, monkeypatch):
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._detect_stale_code = MagicMock(return_value=False)
+        runner._busy_input_mode = "queue"
+        runner._handle_help_command = AsyncMock(return_value="ok")
+        event = _make_event(
+            text="/help https://example.com/not-reviewed",
+            chat_id="!baldr:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+
+        enqueue_mock = AsyncMock()
+        monkeypatch.setattr(_gr.GatewayRunner, "_maybe_enqueue_baldr_cold_link_review", enqueue_mock)
+
+        result = await _gr.GatewayRunner._handle_message(runner, event)
+
+        assert result == "ok"
+        enqueue_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_route_appends_durable_route_event(self, monkeypatch):
+        """Busy-path routing should persist a durable event with reply anchor and target."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val=Platform.MATRIX)
+        event = _make_event(text="чотам", chat_id="!room:matrix.org", platform_val=Platform.MATRIX)
+        event.reply_to_text = "чотам по selfhost-llm-crypto-vps"
+        event.reply_to_message_id = "$prev"
+        sk = build_session_key(event.source)
+        runner._busy_input_mode = "queue"
+        runner._running_agents[sk] = MagicMock()
+        runner.adapters[event.source.platform] = adapter
+
+        captured = []
+        routed_text = '[Replying to: "чотам по selfhost-llm-crypto-vps"]\n\nчотам'
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {
+                    "lane": "control",
+                    "execution": "answer_now",
+                    "priority": "high",
+                    "task_id": "selfhost-llm-vast-deploy",
+                    "target_worker": "planner/selfhost",
+                }
+            if args == ("status-for-text", routed_text, "--json"):
+                return {"reply_text": "сейчас: selfhost-llm-vast-deploy [infra/blocked] — ждёт approve"}
+            return None
+
+        def fake_append(self, payload):
+            captured.append(payload)
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        monkeypatch.setattr(_gr.GatewayRunner, "_append_baldr_route_event", fake_append)
+        monkeypatch.setattr(
+            _gr.GatewayRunner,
+            "_baldr_enqueue_link_review",
+            AsyncMock(return_value={"id": "link-review-123"}),
+        )
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        mock_merge.assert_not_called()
+        assert len(captured) == 1
+        route_event = captured[0]
+        assert route_event["source"] == "matrix-busy-router"
+        assert route_event["session_key"] == sk
+        assert route_event["chat_id"] == "!room:matrix.org"
+        assert route_event["reply_to_message_id"] == "$prev"
+        assert route_event["reply_anchor_text"] == "чотам по selfhost-llm-crypto-vps"
+        assert route_event["route_text"] == routed_text
+        assert route_event["lane"] == "control"
+        assert route_event["priority"] == "high"
+        assert route_event["execution"] == "answer_now"
+        assert route_event["target_task_id"] == "selfhost-llm-vast-deploy"
+        assert route_event["target_worker"] == "planner/selfhost"
+        assert route_event["should_interrupt"] is False
+        assert route_event["link_review_queue_id"] == "link-review-123"
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_background_route_preserves_queue_order(self, monkeypatch):
+        """Background/delegate busy routes must not emit visible /background noise."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="https://github.com/example/repo что тут", platform_val=Platform.MATRIX)
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"api_call_count": 2, "max_iterations": 90}
+        runner._running_agents[sk] = agent
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "research", "execution": "background", "priority": "normal"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        runner._handle_background_command = AsyncMock(return_value="SHOULD NOT SEND BACKGROUND ACK")
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        runner._handle_background_command.assert_not_called()
+        mock_merge.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+        assert "Background task started" not in content
+        assert "Background task complete" not in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_answer_now_link_still_enqueues_review(self, monkeypatch):
+        """Benign URL busy-route control replies should still enqueue durable review work."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="глянь https://example.com/docs", chat_id="!room:matrix.org", platform_val=Platform.MATRIX)
+        sk = build_session_key(event.source)
+        runner._running_agents[sk] = MagicMock()
+        runner.adapters[event.source.platform] = adapter
+        enqueue_mock = AsyncMock(return_value={"id": "link-review-benign"})
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "control", "execution": "answer_now", "priority": "normal"}
+            if args[:1] == ("status-for-text",):
+                return {"reply_text": "сейчас: посмотрю ссылку"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldr_enqueue_link_review", enqueue_mock)
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        enqueue_mock.assert_awaited_once()
+        adapter._send_with_retry.assert_awaited_once()
+        runner._running_agents[sk].interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_background_link_still_enqueues_review(self, monkeypatch):
+        """Suspicious URL busy-route background work should enqueue review before normal queueing."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(
+            text="проверь https://example.com/install-guide before using it",
+            chat_id="!room:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"api_call_count": 2, "max_iterations": 90}
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+        enqueue_mock = AsyncMock(return_value={"id": "link-review-suspicious"})
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "research", "execution": "background", "priority": "normal"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldr_enqueue_link_review", enqueue_mock)
+        runner._handle_background_command = AsyncMock(return_value="SHOULD NOT SEND BACKGROUND ACK")
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        enqueue_mock.assert_awaited_once()
+        runner._handle_background_command.assert_not_called()
+        mock_merge.assert_called_once()
+        agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_urgent_link_reply_interrupts_and_enqueues_review(self, monkeypatch):
+        """Malicious/urgent link corrections should interrupt the active turn after review enqueue."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(
+            text="срочно не открывай https://example.com/risky-download",
+            chat_id="!room:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+        sk = build_session_key(event.source)
+        running_agent = MagicMock()
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+        enqueue_mock = AsyncMock(return_value={"id": "link-review-malicious"})
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "ops", "execution": "answer_now", "priority": "urgent"}
+            if args[:1] == ("status-for-text",):
+                return {"reply_text": "сейчас: остановил и пометил ссылку на review"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldr_enqueue_link_review", enqueue_mock)
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        enqueue_mock.assert_awaited_once()
+        running_agent.interrupt.assert_called_once_with("срочно не открывай https://example.com/risky-download")
+        adapter._send_with_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_baldr_unknown_control_answer_now_has_no_generic_filler(self):
+        """Unknown control/answer_now messages should not get empty meta replies."""
+        runner, _sentinel = _make_runner()
+
+        content = await runner._baldr_control_reply_text(
+            "ок",
+            lane="control",
+            priority="normal",
+            execution="answer_now",
+        )
+
+        assert content is None
+
+    @pytest.mark.asyncio
+    async def test_run_agent_pending_baldr_answer_now_skips_queued_followup(self, monkeypatch, tmp_path):
+        """Pending Matrix control/ops answer_now must not wait behind queued follow-up delivery."""
+        import gateway.run as _gr
+        import hermes_cli.tools_config as tools_config
+
+        class FakeAgent:
+            call_count = 0
+
+            def __init__(self, *args, **kwargs):
+                self.tools = []
+                self.model = "gpt-5.4"
+
+            def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None):
+                type(self).call_count += 1
+                return {
+                    "final_response": "first response",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                }
+
+        class FakeAdapter:
+            edit_message = BasePlatformAdapter.edit_message
+
+            def __init__(self):
+                self._pending_messages = {}
+                self._active_sessions = {}
+                self._post_delivery_callbacks = {}
+                self.config = MagicMock()
+                self.config.extra = {}
+                self.platform = Platform.MATRIX
+                self.send = AsyncMock()
+                self._send_with_retry = AsyncMock(return_value=True)
+
+            def get_pending_message(self, session_key):
+                return self._pending_messages.pop(session_key, None)
+
+            def has_pending_interrupt(self, session_key):
+                return False
+
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = FakeAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+        monkeypatch.setattr(_gr, "_hermes_home", tmp_path)
+        monkeypatch.setattr(_gr, "_env_path", tmp_path / ".env")
+        monkeypatch.setattr(_gr, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        monkeypatch.setattr(_gr, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+        monkeypatch.setattr(
+            _gr,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": "https://example.invalid",
+                "api_key": "***",
+            },
+        )
+        monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+        runner, _sentinel = _make_runner()
+        runner._ephemeral_system_prompt = ""
+        runner._prefill_messages = []
+        runner._reasoning_config = None
+        runner._show_reasoning = False
+        runner._provider_routing = {}
+        runner._fallback_model = None
+        runner._service_tier = None
+        runner._background_tasks = set()
+        runner._session_db = None
+        runner._session_model_overrides = {}
+        runner._session_reasoning_overrides = {}
+        runner._pending_model_notes = {}
+        runner._pending_approvals = {}
+        runner._agent_cache = {}
+        runner._agent_cache_lock = threading.Lock()
+        runner._queued_events = {}
+        runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+        runner._enrich_message_with_vision = AsyncMock(return_value="initial")
+        runner._draining = True
+
+        source = SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!room:matrix.org",
+            chat_type="dm",
+            user_id="@bell:matrix.org",
+            thread_id="thread-1",
+        )
+        pending_event = MessageEvent(
+            text="чотам",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="$pending",
+        )
+        session_key = build_session_key(source)
+        adapter = FakeAdapter()
+        adapter._pending_messages[session_key] = pending_event
+        runner.adapters[source.platform] = adapter
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "control", "execution": "answer_now", "priority": "urgent"}
+            if args == ("status", "--json"):
+                return {"tasks": [{"id": "matrix-parallelism-busy-control", "lane": "ops", "status": "active", "summary": "quick replies verified"}]}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        FakeAgent.call_count = 0
+
+        result = await runner._run_agent(
+            message="initial",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+        )
+
+        assert result["final_response"] == "first response"
+        assert FakeAgent.call_count == 1
+        assert session_key not in adapter._pending_messages
+        adapter._send_with_retry.assert_awaited_once()
+        adapter.send.assert_not_awaited()
+        content = adapter._send_with_retry.await_args.kwargs.get("content", "")
+        assert "сейчас:" in content
+        assert "quick replies verified" in content
+        assert adapter._send_with_retry.await_args.kwargs.get("reply_to") == "$pending"

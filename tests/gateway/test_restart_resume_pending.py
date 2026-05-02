@@ -133,24 +133,61 @@ def _simulate_note_injection(
             if reason == "shutdown_timeout"
             else "a gateway interruption"
         )
+        reply_anchor_clause = ""
+        if str(message or "").lstrip().startswith('[Replying to: "'):
+            reply_anchor_clause = (
+                " Treat the latest quoted/reply target as the primary anchor. "
+                "If older interrupted tool results are about another topic, treat them as background "
+                "and answer the quoted target first."
+            )
         message = (
             f"[System note: Your previous turn in this session was interrupted "
             f"by {reason_phrase}. The conversation history below is intact. "
             f"If it contains unfinished tool result(s), process them first and "
             f"summarize what was accomplished, then address the user's new "
-            f"message below.]\n\n"
+            f"message below.{reply_anchor_clause}]\n\n"
             + message
         )
     elif has_fresh_tool_tail:
+        reply_anchor_clause = ""
+        if str(message or "").lstrip().startswith('[Replying to: "'):
+            reply_anchor_clause = (
+                " Treat the latest quoted/reply target as the primary anchor. "
+                "If older interrupted tool results are about another topic, treat them as background "
+                "and answer the quoted target first."
+            )
         message = (
             "[System note: Your previous turn was interrupted before you could "
             "process the last tool result(s). The conversation history contains "
             "tool outputs you haven't responded to yet. Please finish processing "
             "those results and summarize what was accomplished, then address the "
-            "user's new message below.]\n\n"
+            f"user's new message below.{reply_anchor_clause}]\n\n"
             + message
         )
     return message
+
+
+class TestReplyAnchorPriorityGuard:
+    def test_resume_pending_note_mentions_reply_anchor_priority(self):
+        now = datetime.now()
+        resume_entry = SessionEntry(
+            session_key="k",
+            session_id="sid",
+            created_at=now,
+            updated_at=now,
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            last_resume_marked_at=now,
+        )
+        history = [{"role": "assistant", "content": "old reply", "timestamp": now.isoformat()}]
+        user_message = (
+            '[Replying to: "baldr-fast-router-deep-worker-chain [ops/blocked]"]\n\n'
+            'сравни о чем твой пост и на что он реагирует'
+        )
+
+        result = _simulate_note_injection(history, user_message, resume_entry)
+
+        assert "quoted/reply target as the primary anchor" in result
 
 
 # ---------------------------------------------------------------------------
