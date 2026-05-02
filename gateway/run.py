@@ -2057,6 +2057,10 @@ class GatewayRunner:
             path.parent.mkdir(parents=True, exist_ok=True)
             event = dict(payload or {})
             event.setdefault(
+                "env",
+                (os.environ.get("BALDR_ROUTE_EVENT_ENV", "live") or "live").strip().lower(),
+            )
+            event.setdefault(
                 "timestamp_utc",
                 datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
             )
@@ -2066,6 +2070,17 @@ class GatewayRunner:
             logger.debug("Baldr route event append failed: %s", exc)
 
     async def _baldrctl_json(self, *args: str, timeout: float = 1.5) -> Optional[Dict[str, Any]]:
+        allowed_commands = {
+            ("route", 2),
+            ("status", 2),
+            ("status-for-text", 3),
+        }
+        command = str(args[0]).strip() if args else ""
+        command_key = (command, len(args))
+        if command_key not in allowed_commands:
+            logger.debug("Baldr gateway hook rejected non-allowlisted command: %s", args)
+            return None
+
         script = Path("/srv/agent/scripts/baldrctl.py")
         if not script.exists():
             return None

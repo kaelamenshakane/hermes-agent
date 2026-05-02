@@ -92,6 +92,12 @@ def _make_adapter(platform_val="telegram"):
     return adapter
 
 
+@pytest.fixture(autouse=True)
+def _isolated_baldr_route_events(monkeypatch, tmp_path):
+    monkeypatch.setenv("BALDR_ROUTE_EVENTS_PATH", str(tmp_path / "baldr-route-events.jsonl"))
+    monkeypatch.setenv("BALDR_ROUTE_EVENT_ENV", "test")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -772,6 +778,35 @@ class TestBusySessionOnboardingHint:
         adapter._send_with_retry.assert_awaited_once()
         running_agent.interrupt.assert_called_once_with(event.text)
         mock_merge.assert_not_called()
+
+    def test_append_baldr_route_event_marks_test_env(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        path = tmp_path / "route-events.jsonl"
+        os.environ["BALDR_ROUTE_EVENTS_PATH"] = str(path)
+        os.environ["BALDR_ROUTE_EVENT_ENV"] = "test"
+
+        GatewayRunner._append_baldr_route_event(runner, {"source": "matrix-busy-router", "message_id": "msg1"})
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        item = __import__("json").loads(lines[0])
+        assert item["env"] == "test"
+        assert item["source"] == "matrix-busy-router"
+
+    @pytest.mark.asyncio
+    async def test_baldrctl_json_rejects_non_allowlisted_command(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        create_subprocess = AsyncMock()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+        result = await GatewayRunner._baldrctl_json(runner, "workers", "--json")
+
+        assert result is None
+        create_subprocess.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_baldr_matrix_busy_route_appends_durable_route_event(self, monkeypatch):
