@@ -666,6 +666,50 @@ class TestBusySessionOnboardingHint:
         assert "matrix-parallelism-busy-control" not in content
 
     @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_reply_chotam_anchors_status_in_priority_guard(self, monkeypatch):
+        """Reply-context `чотам` should stay anchored even on _handle_message's direct busy path."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter("matrix")
+        event = _make_event(text="чотам", platform_val=Platform.MATRIX)
+        event.reply_to_text = "чотам по более дешевым за крипту для селфхоста"
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._running_agents[sk] = MagicMock()
+
+        routed_text = '[Replying to: "чотам по более дешевым за крипту для селфхоста"]\n\nчотам'
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                assert args[1] == routed_text
+                return {"lane": "control", "execution": "answer_now", "priority": "high"}
+            if args == ("status-for-text", routed_text, "--json"):
+                return {
+                    "task_id": "selfhost-llm-crypto-vps",
+                    "reply_text": "сейчас: selfhost-llm-crypto-vps [infra/completed] — live Vast shortlist ready\nпоследнее: Vast offer 20299950 shortlisted\nдальше: дождаться approve на реальный deploy",
+                }
+            if args == ("status", "--json"):
+                return {
+                    "tasks": [
+                        {"id": "matrix-parallelism-busy-control", "lane": "ops", "status": "active", "summary": "чиню quick replies"}
+                    ]
+                }
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await _gr.GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        mock_merge.assert_not_called()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "selfhost-llm-crypto-vps" in content
+        assert "Vast offer 20299950" in content
+        assert "matrix-parallelism-busy-control" not in content
+
+    @pytest.mark.asyncio
     async def test_baldr_matrix_busy_correction_answers_immediately(self, monkeypatch):
         """Parallelism/routing corrections should be answered immediately, not queued."""
         import gateway.run as _gr
@@ -695,6 +739,39 @@ class TestBusySessionOnboardingHint:
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
         assert "не должно ждать очереди" in content
         assert "busy-control" in content
+
+    @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_correction_interrupts_active_turn(self, monkeypatch):
+        """Urgent Matrix corrections should ack immediately and stop stale work."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val=Platform.MATRIX)
+        event = _make_event(
+            text="запиши себе: не лезь в код, ты наделал косяк",
+            chat_id="!room:matrix.org",
+            platform_val=Platform.MATRIX,
+        )
+        sk = build_session_key(event.source)
+        running_agent = MagicMock()
+        runner._busy_input_mode = "queue"
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {"lane": "ops", "execution": "answer_now", "priority": "urgent"}
+            return None
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        adapter._send_with_retry.assert_awaited_once()
+        running_agent.interrupt.assert_called_once_with(event.text)
+        mock_merge.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_baldr_matrix_busy_background_route_preserves_queue_order(self, monkeypatch):

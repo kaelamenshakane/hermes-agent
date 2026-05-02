@@ -2159,6 +2159,32 @@ class GatewayRunner:
             return None
         return None
 
+    @staticmethod
+    def _baldr_should_interrupt_busy_turn(text: str, lane: str, priority: str) -> bool:
+        """True when a Matrix busy-path control message supersedes current work.
+
+        For bell, `answer_now` alone is insufficient: urgent corrections must
+        also stop the active turn, otherwise the old turn can continue mutating
+        state after the correction was acknowledged.
+        """
+        lowered = (text or "").lower()
+        if lane not in {"control", "ops"}:
+            return False
+        supersede_terms = (
+            "параллелизм", "паралеллизм", "паралелизм",
+            "параллель", "паралель", "не отвечаешь",
+            "не туда", "не так", "неправил", "косяк", "косяки",
+            "наделал", "исправляй", "чини", "почини",
+            "запомни", "запиши себе", "не лезь", "не трогай",
+            "останов", "хватит", "стоп", "отмени", "срочно",
+            "сломал", "не работает", "доступ потерян", "крит",
+        )
+        if any(term in lowered for term in supersede_terms):
+            return True
+        return priority == "urgent" and any(
+            term in lowered for term in ("ops", "urgent", "важно", "сейчас")
+        )
+
     async def _maybe_handle_baldr_busy_route(
         self,
         event: MessageEvent,
@@ -2213,6 +2239,21 @@ class GatewayRunner:
                     reply_to=event.message_id,
                     metadata=thread_meta,
                 )
+                if self._baldr_should_interrupt_busy_turn(text, lane, priority):
+                    running_agent = self._running_agents.get(session_key)
+                    if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                        try:
+                            running_agent.interrupt(text)
+                            logger.info(
+                                "Baldr Matrix busy correction interrupted active turn for session %s",
+                                session_key or "?",
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Baldr busy correction could not interrupt active turn for session %s: %s",
+                                session_key or "?",
+                                exc,
+                            )
                 return True
         if execution in {"background", "delegate"} and lane in {"code", "research", "finalempire", "cheap"}:
             # Do not auto-convert Matrix busy messages into visible /background
