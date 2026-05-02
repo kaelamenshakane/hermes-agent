@@ -2161,6 +2161,27 @@ class GatewayRunner:
             logger.debug("Baldr link-review enqueue failed for %s: %s", event.message_id or "?", exc)
             return None
 
+    async def _maybe_enqueue_baldr_cold_link_review(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Fail-open cold-path enqueue for non-busy Matrix URL intake.
+
+        This mirrors the busy-path durable queue handoff so bell's regular Matrix
+        messages with links are reviewable even when no active session is busy.
+        Commands and non-text messages are ignored.
+        """
+        if not self._baldr_gateway_router_enabled():
+            return None
+        if event.source.platform != Platform.MATRIX:
+            return None
+        if event.message_type != MessageType.TEXT:
+            return None
+        text = (event.text or "").strip()
+        if not text or event.is_command():
+            return None
+        return await self._baldr_enqueue_link_review(
+            event,
+            reply_anchor_text=str(getattr(event, "reply_to_text", None) or "")[:500] or None,
+        )
+
     async def _baldr_status_text(self, reply_context_text: Optional[str] = None) -> Optional[str]:
         """Return a compact Baldr control-plane snapshot for Matrix busy replies."""
         if reply_context_text:
@@ -5398,6 +5419,8 @@ class GatewayRunner:
 
         # Check for commands
         command = event.get_command()
+        if not command:
+            await self._maybe_enqueue_baldr_cold_link_review(event)
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
