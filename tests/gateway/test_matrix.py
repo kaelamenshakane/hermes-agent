@@ -482,6 +482,7 @@ class TestMatrixReplyFallbackStripping:
         self.adapter._startup_ts = 0.0
         self.adapter._dm_rooms = {}
         self.adapter._message_handler = AsyncMock()
+        self.adapter._text_batch_delay_seconds = 0
 
     def _strip_fallback(self, body: str, has_reply: bool = True) -> str:
         """Simulate the reply fallback stripping logic from _on_room_message."""
@@ -511,6 +512,70 @@ class TestMatrixReplyFallbackStripping:
         body = "> <@alice:ex.org> Line 1\n> Line 2\n\nMy response"
         result = self._strip_fallback(body)
         assert result == "My response"
+
+    def test_extract_reply_fallback_text(self):
+        body = "> <@alice:ex.org> Original message\n\nActual reply"
+        assert self.adapter._extract_reply_fallback_text(body) == "Original message"
+
+    def test_extract_multiline_reply_fallback_text(self):
+        body = "> <@alice:ex.org> Line 1\n> Line 2\n\nMy response"
+        assert self.adapter._extract_reply_fallback_text(body) == "Line 1\nLine 2"
+
+    @pytest.mark.asyncio
+    async def test_fetch_event_text_from_matrix_client(self):
+        event = types.SimpleNamespace(content={"msgtype": "m.text", "body": "Original from server"})
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock(return_value=event)
+
+        text = await self.adapter._fetch_event_text("!room:ex.org", "$event")
+
+        assert text == "Original from server"
+        self.adapter._client.get_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_text_message_sets_reply_to_text_from_fallback(self):
+        body = "> <@alice:ex.org> Original message\n\nа это?"
+        self.adapter._resolve_message_context = AsyncMock(
+            return_value=(body, True, "direct", None, "Alice", "matrix")
+        )
+        self.adapter.handle_message = AsyncMock()
+
+        await self.adapter._handle_text_message(
+            "!room:ex.org",
+            "@alice:ex.org",
+            "$reply",
+            1.0,
+            {"body": body, "msgtype": "m.text"},
+            {"m.in_reply_to": {"event_id": "$original"}},
+        )
+
+        msg_event = self.adapter.handle_message.await_args.args[0]
+        assert msg_event.text == "а это?"
+        assert msg_event.reply_to_message_id == "$original"
+        assert msg_event.reply_to_text == "Original message"
+
+    @pytest.mark.asyncio
+    async def test_handle_text_message_fetches_reply_to_text_without_fallback(self):
+        self.adapter._resolve_message_context = AsyncMock(
+            return_value=("а это?", True, "direct", None, "Alice", "matrix")
+        )
+        self.adapter._fetch_event_text = AsyncMock(return_value="Original from server")
+        self.adapter.handle_message = AsyncMock()
+
+        await self.adapter._handle_text_message(
+            "!room:ex.org",
+            "@alice:ex.org",
+            "$reply",
+            1.0,
+            {"body": "а это?", "msgtype": "m.text"},
+            {"m.in_reply_to": {"event_id": "$original"}},
+        )
+
+        msg_event = self.adapter.handle_message.await_args.args[0]
+        assert msg_event.text == "а это?"
+        assert msg_event.reply_to_message_id == "$original"
+        assert msg_event.reply_to_text == "Original from server"
+        self.adapter._fetch_event_text.assert_awaited_once_with("!room:ex.org", "$original")
 
     def test_no_reply_fallback_preserved(self):
         body = "Just a normal message"

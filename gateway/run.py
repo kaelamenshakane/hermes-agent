@@ -2033,6 +2033,192 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _baldr_gateway_router_enabled(self) -> bool:
+        """Return whether the local Baldr busy-router hook should run.
+
+        The hook is fail-open: errors/timeouts fall back to the existing
+        busy-input behavior.  It is Matrix-only in the call site below.
+        """
+        raw = os.environ.get("BALDR_GATEWAY_HOOK_ENABLED", "true")
+        return raw.lower() not in {"0", "false", "no", "off"}
+
+    async def _baldrctl_json(self, *args: str, timeout: float = 1.5) -> Optional[Dict[str, Any]]:
+        script = Path("/srv/agent/scripts/baldrctl.py")
+        if not script.exists():
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0 or not stdout:
+                return None
+            return json.loads(stdout.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            logger.debug("Baldr gateway hook failed: %s", exc)
+            return None
+
+    async def _baldr_status_text(self) -> Optional[str]:
+        """Return a compact Baldr control-plane snapshot for Matrix busy replies."""
+        status = await self._baldrctl_json("status", "--json", timeout=1.5)
+        if status:
+            tasks = status.get("tasks") or status.get("items") or []
+            if isinstance(tasks, list) and tasks:
+                lines = []
+                for task in tasks[:5]:
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = str(task.get("id") or task.get("task_id") or "task")
+                    lane = str(task.get("lane") or "?")
+                    state = str(task.get("status") or task.get("state") or "?")
+                    summary = str(task.get("summary") or task.get("title") or task.get("content") or "").strip()
+                    text = f"{task_id} [{lane}/{state}]"
+                    if summary:
+                        text = f"{text} — {summary}"
+                    lines.append(text)
+                if lines:
+                    return "сейчас: " + "\n".join(lines)[:1100]
+            if isinstance(status.get("summary"), str) and status["summary"].strip():
+                return "сейчас: " + status["summary"].strip()[:1100]
+
+        script = Path("/srv/agent/scripts/baldrctl.py")
+        if not script.exists():
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                "snapshot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.5)
+            if proc.returncode == 0 and stdout:
+                return stdout.decode("utf-8", errors="replace").strip()[:1200]
+        except Exception as exc:
+            logger.debug("Baldr status snapshot failed: %s", exc)
+        return None
+
+    async def _baldr_control_reply_text(
+        self,
+        text: str,
+        lane: str,
+        priority: str,
+        execution: str = "answer_now",
+    ) -> Optional[str]:
+        """Return a short local reply for Matrix busy-path control messages.
+
+        This intentionally avoids an LLM call: while the main session is busy,
+        bell still needs direct answers to control/status/correction messages.
+        Unknown content falls back to normal queue behavior.
+        """
+        lowered = text.lower()
+        status_terms = (
+            "что делаешь", "что ты делаешь", "что сейчас", "что там",
+            "чотам", "че там", "чё там",
+            "почему молч", "статус", "жду", "сам работаешь",
+        )
+        report_terms = (
+            "что напишешь", "как сделаешь", "когда законч", "как сделаешь все",
+        )
+        correction_terms = (
+            "параллелизм", "паралеллизм", "паралелизм",
+            "параллель", "паралель", "параллел", "паралел",
+            "не отвечаешь", "других линиях", "другие линии",
+            "ревьювить", "косяк", "косяки",
+        )
+        if any(term in lowered for term in status_terms):
+            return await self._baldr_status_text()
+        if any(term in lowered for term in report_terms):
+            return (
+                "Да: по завершении напишу сюда коротко — что сделал, "
+                "что проверил, где результат, и что осталось/заблокировано."
+            )
+        if lane in {"ops", "control"} and any(term in lowered for term in correction_terms):
+            return (
+                "Принял. Это не должно ждать очереди: ревью параллелизма/Matrix routing "
+                "приоритетнее текущей работы. Фикс: busy-control отвечать сразу, "
+                "остальное — в worker/background, не в молчаливую очередь."
+            )
+        if lane == "ops" and priority == "urgent":
+            return "Принял как urgent ops. Остановлю обычную очередь и разберу доступ/Matrix/gateway первым."
+        if lane == "control" and execution == "answer_now":
+            # Do not emit generic filler for unknown control messages. If the
+            # local router cannot produce a concrete status/action reply, let
+            # the normal queue path handle the message instead.
+            return None
+        return None
+
+    async def _maybe_handle_baldr_busy_route(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        adapter: Any,
+    ) -> bool:
+        """Matrix busy-path pre-router for Baldr.
+
+        When the main Matrix session is busy, route status questions to the
+        durable Baldr registry and route independent long work through the
+        existing /background mechanism instead of steering everything into the
+        current chat run.
+        """
+        if not self._baldr_gateway_router_enabled():
+            return False
+        if event.source.platform != Platform.MATRIX:
+            return False
+        if event.message_type != MessageType.TEXT:
+            return False
+        text = (event.text or "").strip()
+        if not text or event.is_command():
+            return False
+
+        route_text = text
+        reply_text = getattr(event, "reply_to_text", None)
+        if reply_text:
+            # Reply context is the primary anchor for bell's short Matrix replies
+            # like "а это?", "почему?", "так и не ответил".
+            route_text = f'[Replying to: "{str(reply_text)[:500]}"]\n\n{text}'
+
+        decision = await self._baldrctl_json("route", route_text, timeout=1.5)
+        if not decision:
+            return False
+
+        lane = str(decision.get("lane") or "control")
+        execution = str(decision.get("execution") or "answer_now")
+        priority = str(decision.get("priority") or "normal")
+        thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+
+        if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
+            control_text = await self._baldr_control_reply_text(text, lane, priority, execution)
+            if control_text:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=control_text,
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                return True
+
+        if execution in {"background", "delegate"} and lane in {"code", "research", "finalempire", "cheap"}:
+            bg_prompt = (
+                "Baldr routed this Matrix message while the main session was busy. "
+                f"Lane: {lane}; priority: {priority}. Respond in concise Russian.\n\n"
+                f"User message: {text}"
+            )
+            routed_event = dataclasses.replace(event, text=f"/background {bg_prompt}")
+            ack = await self._handle_background_command(routed_event)
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=ack,
+                reply_to=event.message_id,
+                metadata=thread_meta,
+            )
+            return True
+
+        return False
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -2075,6 +2261,15 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
+
+        # Baldr Matrix pre-router: answer status questions immediately and route
+        # independent long work to /background instead of injecting everything
+        # into the active chat run.  Fail-open to existing busy behavior.
+        try:
+            if await self._maybe_handle_baldr_busy_route(event, session_key, adapter):
+                return True
+        except Exception as exc:
+            logger.debug("Baldr busy-route hook fell back to default behavior: %s", exc)
 
         running_agent = self._running_agents.get(session_key)
 
@@ -4922,6 +5117,19 @@ class GatewayRunner:
                     f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
+
+            # Baldr Matrix control/status messages must bypass the generic
+            # busy queue here as well as in the adapter busy-handler path.
+            # This catches follow-ups that arrive while _handle_message sees
+            # _running_agents directly; otherwise `чотам` can sit behind the
+            # previous turn until final stream delivery/queue drain finishes.
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                try:
+                    if await self._maybe_handle_baldr_busy_route(event, _quick_key, adapter):
+                        return None
+                except Exception as exc:
+                    logger.debug("Baldr priority-route hook fell back to default behavior: %s", exc)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -8532,6 +8740,13 @@ class GatewayRunner:
                 source=source,
                 user_config=user_config,
             )
+            background_cfg = (user_config.get("background") or {}) if isinstance(user_config, dict) else {}
+            background_model = background_cfg.get("model") or os.getenv("HERMES_BACKGROUND_MODEL")
+            background_provider = background_cfg.get("provider") or os.getenv("HERMES_BACKGROUND_PROVIDER")
+            if background_model:
+                model = str(background_model)
+            if background_provider:
+                runtime_kwargs["provider"] = str(background_provider)
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -13317,9 +13532,46 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+            # Baldr Matrix control/ops answer_now fast path for messages that
+            # already reached the pending queue. These must not wait behind
+            # final stream confirmation / first-response resend before being
+            # answered. The hook is fail-open: on errors, normal queued
+            # follow-up handling below still applies.
+            if pending_event is not None and adapter is not None:
+                try:
+                    if await self._maybe_handle_baldr_busy_route(
+                        pending_event,
+                        session_key,
+                        adapter,
+                    ):
+                        logger.info(
+                            "Handled pending Baldr Matrix control event immediately for session %s",
+                            session_key or "?",
+                        )
+                        pending_event = None
+                        pending = None
+
+                        next_pending_event = _dequeue_pending_event(adapter, session_key)
+                        next_pending_event = self._promote_queued_event(
+                            session_key,
+                            adapter,
+                            next_pending_event,
+                        )
+                        if next_pending_event is not None:
+                            pending_event = next_pending_event
+                            pending = (
+                                next_pending_event.text
+                                or _build_media_placeholder(next_pending_event)
+                            )
+                except Exception as exc:
+                    logger.debug(
+                        "Pending Baldr busy-route hook fell back to queued follow-up behavior: %s",
+                        exc,
+                    )
+
             if self._draining and (pending_event or pending):
                 logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
+                    "Discarding non-control pending follow-up for session %s during gateway %s",
                     session_key or "?",
                     self._status_action_label(),
                 )
