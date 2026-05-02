@@ -1637,7 +1637,49 @@ class MatrixAdapter(BasePlatformAdapter):
             quoted[0] = first.split("> ", 1)[1]
 
         text = "\n".join(quoted).strip()
-        return text or None
+        return MatrixAdapter._normalize_reply_context_text(text)
+
+    @staticmethod
+    def _strip_matrix_reply_fallback(body: str) -> str:
+        """Remove Matrix plaintext reply fallback from ``body`` if present."""
+        if not body or not body.startswith("> "):
+            return body
+
+        lines = body.split("\n")
+        stripped: list[str] = []
+        past_fallback = False
+        for line in lines:
+            if not past_fallback:
+                if line.startswith("> ") or line == ">":
+                    continue
+                if line == "":
+                    past_fallback = True
+                    continue
+                past_fallback = True
+            stripped.append(line)
+        return "\n".join(stripped) if stripped else body
+
+    @staticmethod
+    def _normalize_reply_context_text(text: str) -> Optional[str]:
+        """Normalize fetched/quoted parent text before gateway injection.
+
+        Matrix replies can quote a Hermes message that already starts with our
+        synthetic ``[Replying to: "..."]`` prefix. In a chain, that older prefix
+        becomes stale context and can make the next turn answer the wrong target.
+        Keep the direct parent body, but drop Matrix fallback and leading
+        synthetic reply-context blocks.
+        """
+        if not text:
+            return None
+
+        text = MatrixAdapter._strip_matrix_reply_fallback(str(text)).strip()
+        prefix = '[Replying to: "'
+        while text.startswith(prefix):
+            marker_index = text.find('"]')
+            if marker_index < 0:
+                break
+            text = text[marker_index + 2 :].lstrip()
+        return text.strip() or None
 
     @staticmethod
     def _event_content_dict(event: Any) -> dict:
@@ -1672,10 +1714,11 @@ class MatrixAdapter(BasePlatformAdapter):
         if not body:
             return None
         if msgtype in ("m.text", "m.notice", "m.emote"):
-            return body
+            return self._normalize_reply_context_text(body)
         if msgtype.startswith("m."):
-            return f"[{msgtype}] {body}"
-        return body
+            normalized = self._normalize_reply_context_text(body) or body
+            return f"[{msgtype}] {normalized}"
+        return self._normalize_reply_context_text(body)
 
     async def _handle_text_message(
         self,
@@ -1717,19 +1760,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Strip reply fallback from body.
         if reply_to and body.startswith("> "):
-            lines = body.split("\n")
-            stripped = []
-            past_fallback = False
-            for line in lines:
-                if not past_fallback:
-                    if line.startswith("> ") or line == ">":
-                        continue
-                    if line == "":
-                        past_fallback = True
-                        continue
-                    past_fallback = True
-                stripped.append(line)
-            body = "\n".join(stripped) if stripped else body
+            body = self._strip_matrix_reply_fallback(body)
 
         msg_type = MessageType.TEXT
         if body.startswith(("!", "/")):

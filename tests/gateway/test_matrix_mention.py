@@ -47,6 +47,7 @@ def _make_event(
     room_id="!room1:example.org",
     formatted_body=None,
     thread_id=None,
+    reply_to=None,
     mention_user_ids=None,
 ):
     """Create a fake room message event.
@@ -67,6 +68,8 @@ def _make_event(
     if thread_id:
         relates_to["rel_type"] = "m.thread"
         relates_to["event_id"] = thread_id
+    if reply_to:
+        relates_to["m.in_reply_to"] = {"event_id": reply_to}
     if relates_to:
         content["m.relates_to"] = relates_to
 
@@ -528,6 +531,75 @@ async def test_auto_thread_skips_dm(monkeypatch):
     adapter.handle_message.assert_awaited_once()
     msg = adapter.handle_message.await_args.args[0]
     assert msg.source.thread_id is None
+
+
+# ---------------------------------------------------------------------------
+# Matrix reply fallback / quote-chain handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reply_to_text_strips_synthetic_reply_prefix_from_quoted_parent(monkeypatch):
+    """Reply chains should anchor to the direct parent, not stale nested quote text."""
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+
+    adapter = _make_adapter()
+    event = _make_event(
+        '> <@hermes:example.org> [Replying to: "old model-list task"]\n'
+        "> \n"
+        "> Direct answer about browser route\n"
+        "\n"
+        "делай",
+        reply_to="$parent",
+    )
+
+    await adapter._on_room_message(event)
+
+    adapter.handle_message.assert_awaited_once()
+    msg = adapter.handle_message.await_args.args[0]
+    assert msg.text == "делай"
+    assert msg.reply_to_message_id == "$parent"
+    assert msg.reply_to_text == "Direct answer about browser route"
+
+
+@pytest.mark.asyncio
+async def test_fetched_reply_text_strips_matrix_fallback_and_synthetic_prefix(monkeypatch):
+    """Fallback fetch should normalize quoted parent bodies before gateway injection."""
+    from gateway.platforms.matrix import MatrixAdapter
+
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+    adapter = _make_adapter()
+
+    class FakeClient:
+        async def get_event(self, room_id, event_id):
+            return SimpleNamespace(
+                content={
+                    "msgtype": "m.text",
+                    "body": (
+                        '> <@alice:example.org> stale quoted ask\n'
+                        "> \n"
+                        '> stale quoted context\n'
+                        "\n"
+                        '[Replying to: "older stale ask"]\n'
+                        "\n"
+                        "Fresh parent answer"
+                    ),
+                }
+            )
+
+    adapter._client = FakeClient()
+
+    assert await MatrixAdapter._fetch_event_text(adapter, "!room1:example.org", "$parent") == "Fresh parent answer"
+
+
+def test_normalize_reply_context_strips_synthetic_prefix_with_inner_quotes():
+    from gateway.platforms.matrix import MatrixAdapter
+
+    assert (
+        MatrixAdapter._normalize_reply_context_text('[Replying to: "old "quoted" task"]\n\nFresh answer')
+        == "Fresh answer"
+    )
 
 
 @pytest.mark.asyncio
