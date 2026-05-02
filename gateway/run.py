@@ -2042,6 +2042,29 @@ class GatewayRunner:
         raw = os.environ.get("BALDR_GATEWAY_HOOK_ENABLED", "true")
         return raw.lower() not in {"0", "false", "no", "off"}
 
+    def _append_baldr_route_event(self, payload: Dict[str, Any]) -> None:
+        """Append a durable Baldr route event for busy-path routing decisions.
+
+        This is intentionally fail-open: routing must continue even if the
+        durable event log is unavailable.
+        """
+        path_raw = os.environ.get(
+            "BALDR_ROUTE_EVENTS_PATH",
+            "/srv/agent/state/baldr-route-events.jsonl",
+        )
+        try:
+            path = Path(path_raw).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            event = dict(payload or {})
+            event.setdefault(
+                "timestamp_utc",
+                datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            )
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception as exc:
+            logger.debug("Baldr route event append failed: %s", exc)
+
     async def _baldrctl_json(self, *args: str, timeout: float = 1.5) -> Optional[Dict[str, Any]]:
         script = Path("/srv/agent/scripts/baldrctl.py")
         if not script.exists():
@@ -2222,6 +2245,24 @@ class GatewayRunner:
         lane = str(decision.get("lane") or "control")
         execution = str(decision.get("execution") or "answer_now")
         priority = str(decision.get("priority") or "normal")
+        should_interrupt = self._baldr_should_interrupt_busy_turn(text, lane, priority)
+        route_event = {
+            "source": "matrix-busy-router",
+            "session_key": session_key,
+            "chat_id": event.source.chat_id,
+            "message_id": event.message_id,
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "reply_anchor_text": str(reply_text)[:500] if reply_text else None,
+            "user_text": text[:1000],
+            "route_text": route_text[:1500],
+            "lane": lane,
+            "priority": priority,
+            "execution": execution,
+            "target_task_id": decision.get("task_id") or decision.get("target_task_id"),
+            "target_worker": decision.get("target_worker") or decision.get("worker"),
+            "should_interrupt": should_interrupt,
+        }
+        self._append_baldr_route_event(route_event)
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
 
         if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
@@ -2239,7 +2280,7 @@ class GatewayRunner:
                     reply_to=event.message_id,
                     metadata=thread_meta,
                 )
-                if self._baldr_should_interrupt_busy_turn(text, lane, priority):
+                if should_interrupt:
                     running_agent = self._running_agents.get(session_key)
                     if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                         try:

@@ -774,6 +774,63 @@ class TestBusySessionOnboardingHint:
         mock_merge.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_baldr_matrix_busy_route_appends_durable_route_event(self, monkeypatch):
+        """Busy-path routing should persist a durable event with reply anchor and target."""
+        import gateway.run as _gr
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val=Platform.MATRIX)
+        event = _make_event(text="чотам", chat_id="!room:matrix.org", platform_val=Platform.MATRIX)
+        event.reply_to_text = "чотам по selfhost-llm-crypto-vps"
+        event.reply_to_message_id = "$prev"
+        sk = build_session_key(event.source)
+        runner._busy_input_mode = "queue"
+        runner._running_agents[sk] = MagicMock()
+        runner.adapters[event.source.platform] = adapter
+
+        captured = []
+        routed_text = '[Replying to: "чотам по selfhost-llm-crypto-vps"]\n\nчотам'
+
+        async def fake_json(self, *args, timeout=1.5):
+            if args[:1] == ("route",):
+                return {
+                    "lane": "control",
+                    "execution": "answer_now",
+                    "priority": "high",
+                    "task_id": "selfhost-llm-vast-deploy",
+                    "target_worker": "planner/selfhost",
+                }
+            if args == ("status-for-text", routed_text, "--json"):
+                return {"reply_text": "сейчас: selfhost-llm-vast-deploy [infra/blocked] — ждёт approve"}
+            return None
+
+        def fake_append(self, payload):
+            captured.append(payload)
+
+        monkeypatch.setattr(_gr.GatewayRunner, "_baldrctl_json", fake_json)
+        monkeypatch.setattr(_gr.GatewayRunner, "_append_baldr_route_event", fake_append)
+
+        with patch("gateway.run.merge_pending_message_event") as mock_merge:
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        mock_merge.assert_not_called()
+        assert len(captured) == 1
+        route_event = captured[0]
+        assert route_event["source"] == "matrix-busy-router"
+        assert route_event["session_key"] == sk
+        assert route_event["chat_id"] == "!room:matrix.org"
+        assert route_event["reply_to_message_id"] == "$prev"
+        assert route_event["reply_anchor_text"] == "чотам по selfhost-llm-crypto-vps"
+        assert route_event["route_text"] == routed_text
+        assert route_event["lane"] == "control"
+        assert route_event["priority"] == "high"
+        assert route_event["execution"] == "answer_now"
+        assert route_event["target_task_id"] == "selfhost-llm-vast-deploy"
+        assert route_event["target_worker"] == "planner/selfhost"
+        assert route_event["should_interrupt"] is False
+
+    @pytest.mark.asyncio
     async def test_baldr_matrix_busy_background_route_preserves_queue_order(self, monkeypatch):
         """Background/delegate busy routes must not emit visible /background noise."""
         import gateway.run as _gr
