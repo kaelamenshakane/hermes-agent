@@ -1052,6 +1052,12 @@ class GatewayRunner:
         self._queued_events: Dict[str, List[MessageEvent]] = {}
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
+        # Matrix thought-stream coalescing.  Bell often sends a fast burst of
+        # small messages that are one intent, not N unrelated tasks.  These
+        # maps hold short-lived debounce buffers for busy-session L0 handoffs.
+        self._baldr_matrix_burst_buffers: Dict[str, Dict[str, Any]] = {}
+        self._baldr_matrix_burst_tasks: Dict[str, asyncio.Task] = {}
+        self._baldr_matrix_burst_ack_ts: Dict[str, float] = {}
         self._session_run_generation: Dict[str, int] = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
@@ -2039,11 +2045,75 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    @staticmethod
+    def _baldr_matrix_burst_enabled() -> bool:
+        return os.environ.get("BALDR_MATRIX_BURST_COALESCE_ENABLED", "true").lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
+    @staticmethod
+    def _baldr_matrix_burst_grace_seconds() -> float:
+        return max(0.0, min(_float_env("BALDR_MATRIX_BURST_GRACE_SECONDS", 1.4), 8.0))
+
+    @staticmethod
+    def _baldr_is_matrix_text_event(event: MessageEvent) -> bool:
+        return (
+            event is not None
+            and getattr(getattr(event, "source", None), "platform", None) == Platform.MATRIX
+            and getattr(event, "message_type", None) == MessageType.TEXT
+            and bool((getattr(event, "text", None) or "").strip())
+        )
+
+    @staticmethod
+    def _baldr_burst_item_text(event: MessageEvent) -> str:
+        text = (getattr(event, "text", None) or "").strip()
+        reply_text = getattr(event, "reply_to_text", None)
+        if reply_text:
+            return f'[Replying to: "{str(reply_text)[:500]}"]\n{text}'
+        return text
+
+    @staticmethod
+    def _baldr_combined_burst_text(items: List[Dict[str, Any]]) -> str:
+        if len(items) <= 1:
+            return str(items[0].get("text") or "") if items else ""
+        lines = [
+            (
+                f"[Matrix burst: {len(items)} quick messages from bell. "
+                "Treat them as one continuous request; later lines refine earlier lines.]"
+            )
+        ]
+        for idx, item in enumerate(items, 1):
+            text = str(item.get("text") or "").strip()
+            if text:
+                lines.append(f"{idx}. {text}")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _baldr_replay_event_with_text(base_event: MessageEvent, text: str) -> MessageEvent:
+        return dataclasses.replace(
+            base_event,
+            text=text,
+            message_type=MessageType.TEXT,
+            media_urls=list(getattr(base_event, "media_urls", []) or []),
+            media_types=list(getattr(base_event, "media_types", []) or []),
+        )
+
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: Optional[bool] = None,
+    ) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        if merge_text is None:
+            merge_text = self._baldr_is_matrix_text_event(event)
+        merge_pending_message_event(adapter._pending_messages, session_key, event, merge_text=merge_text)
 
     def _baldr_gateway_router_enabled(self) -> bool:
         """Return whether the local Baldr busy-router hook should run.
@@ -2206,6 +2276,262 @@ class GatewayRunner:
         except Exception as exc:
             logger.debug("Baldr worker dispatch hook failed: %s", exc)
             return None
+
+    async def _maybe_coalesce_baldr_cold_burst(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        run_generation: Optional[int],
+    ) -> Optional[MessageEvent]:
+        """Wait briefly on new Matrix turns and merge rapid follow-up fragments.
+
+        The gateway already marks the session as running before this is called,
+        so racing follow-ups land in the adapter pending slot.  A short silence
+        window lets a fast human thought-stream become one coherent prompt
+        instead of "first fragment now, the rest as a later correction".
+        """
+        if not self._baldr_matrix_burst_enabled() or not self._baldr_is_matrix_text_event(event):
+            return event
+        if event.is_command():
+            return event
+
+        # Keep true status checks instant.
+        decision = await self._baldr_l0_route_json(
+            event,
+            session_key,
+            reply_context_text=str(getattr(event, "reply_to_text", None))[:500]
+            if getattr(event, "reply_to_text", None)
+            else None,
+            timeout=1.0,
+            write=False,
+        )
+        if decision and (
+            bool(decision.get("status_intent"))
+            or bool(decision.get("secret_like"))
+            or str(decision.get("lane") or "") in {"approval", "log"}
+        ):
+            return event
+
+        grace = self._baldr_matrix_burst_grace_seconds()
+        if grace <= 0:
+            return event
+
+        try:
+            await asyncio.sleep(grace)
+        except asyncio.CancelledError:
+            raise
+
+        if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
+            return None
+
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter or not hasattr(adapter, "get_pending_message"):
+            return event
+
+        items: List[Dict[str, Any]] = [{"text": self._baldr_burst_item_text(event), "message_id": event.message_id}]
+        merged_event = event
+        pending_event = _dequeue_pending_event(adapter, session_key)
+        while pending_event is not None:
+            if (
+                not self._baldr_is_matrix_text_event(pending_event)
+                or pending_event.is_command()
+            ):
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    pending_event,
+                    merge_text=self._baldr_is_matrix_text_event(pending_event),
+                )
+                break
+            items.append({
+                "text": self._baldr_burst_item_text(pending_event),
+                "message_id": pending_event.message_id,
+            })
+            merged_event = pending_event
+            pending_event = _dequeue_pending_event(adapter, session_key)
+
+        if len(items) <= 1:
+            return event
+
+        combined = self._baldr_combined_burst_text(items)
+        coalesced = self._baldr_replay_event_with_text(merged_event, combined)
+        logger.info(
+            "Baldr Matrix cold burst coalesced %d messages for session %s",
+            len(items),
+            session_key or "?",
+        )
+
+        if os.environ.get("BALDR_MATRIX_BURST_ACK_ENABLED", "true").lower() not in {"0", "false", "no", "off"}:
+            try:
+                thread_meta = {"thread_id": coalesced.source.thread_id} if coalesced.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=coalesced.source.chat_id,
+                    content=f"принял поток: собрал {len(items)} сообщений в один запрос; разбираю цельно.",
+                    reply_to=coalesced.message_id,
+                    metadata=thread_meta,
+                )
+            except Exception as exc:
+                logger.debug("Baldr Matrix burst ack failed: %s", exc)
+        return coalesced
+
+    async def _baldr_flush_matrix_burst(self, session_key: str, task: Optional[asyncio.Task] = None) -> None:
+        grace = self._baldr_matrix_burst_grace_seconds()
+        try:
+            if grace > 0:
+                await asyncio.sleep(grace)
+            current_task = asyncio.current_task()
+            if task is not None and current_task is not task:
+                return
+            state = self._baldr_matrix_burst_buffers.pop(session_key, None)
+            if not state:
+                return
+            if self._baldr_matrix_burst_tasks.get(session_key) is current_task:
+                self._baldr_matrix_burst_tasks.pop(session_key, None)
+
+            items = list(state.get("items") or [])
+            latest_event = state.get("latest_event")
+            adapter = state.get("adapter")
+            if not items or latest_event is None or adapter is None:
+                return
+            combined = self._baldr_combined_burst_text(items)
+            flush_event = self._baldr_replay_event_with_text(latest_event, combined)
+
+            reply_text = getattr(flush_event, "reply_to_text", None)
+            decision = await self._baldr_l0_route_json(
+                flush_event,
+                session_key,
+                reply_context_text=str(reply_text)[:500] if reply_text else None,
+                timeout=2.5,
+                write=True,
+            )
+            decision_from_l0 = bool(decision)
+            if not decision:
+                decision = await self._baldrctl_json("route", combined, timeout=1.5)
+            if not decision:
+                merge_pending_message_event(adapter._pending_messages, session_key, flush_event, merge_text=True)
+                return
+
+            lane = str(decision.get("lane") or "control")
+            execution = str(decision.get("execution") or "answer_now")
+            priority = str(decision.get("priority") or "normal")
+            route_event = dict(decision)
+            route_event["source"] = "matrix-burst-router"
+            route_event["session_key"] = session_key
+            route_event["chat_id"] = flush_event.source.chat_id
+            route_event["room_name"] = getattr(flush_event.source, "chat_name", None)
+            route_event["message_id"] = flush_event.message_id
+            route_event["user_text"] = combined[:2000]
+            route_event["route_text"] = combined[:2500]
+            route_event["burst_count"] = len(items)
+
+            await self._baldr_enqueue_link_review(
+                flush_event,
+                reply_anchor_text=str(reply_text)[:500] if reply_text else None,
+            )
+
+            thread_meta = {"thread_id": flush_event.source.thread_id} if flush_event.source.thread_id else None
+            if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
+                if not decision_from_l0:
+                    self._append_baldr_route_event(route_event)
+                control_text = await self._baldr_control_reply_text(
+                    combined,
+                    lane,
+                    priority,
+                    execution,
+                    reply_context_text=combined,
+                )
+                if control_text:
+                    await adapter._send_with_retry(
+                        chat_id=flush_event.source.chat_id,
+                        content=control_text[:1200],
+                        reply_to=flush_event.message_id,
+                        metadata=thread_meta,
+                    )
+                    return
+                merge_pending_message_event(adapter._pending_messages, session_key, flush_event, merge_text=True)
+                return
+
+            if (
+                execution in {"background", "delegate"}
+                and decision_from_l0
+                and os.environ.get("BALDR_GATEWAY_ROUTE_HANDOFF_ENABLED", "true").lower()
+                not in {"0", "false", "no", "off"}
+            ):
+                dispatch = await self._baldr_dispatch_worker_handoff(route_event)
+                if dispatch:
+                    ack = str(route_event.get("ack_text") or "").strip()
+                    if not ack:
+                        ack = (
+                            f"принял -> {route_event.get('project') or 'project'}/{lane}; "
+                            f"task={route_event.get('target_task_id') or 'task'}; отправил в worker"
+                        )
+                    ack = f"{ack}\nсобрал burst: {len(items)} сообщений."
+                    await adapter._send_with_retry(
+                        chat_id=flush_event.source.chat_id,
+                        content=ack[:1200],
+                        reply_to=flush_event.message_id,
+                        metadata=thread_meta,
+                    )
+                    return
+
+            merge_pending_message_event(adapter._pending_messages, session_key, flush_event, merge_text=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Baldr Matrix burst flush failed: %s", exc)
+
+    async def _buffer_baldr_matrix_burst_handoff(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        adapter: Any,
+    ) -> bool:
+        if not self._baldr_matrix_burst_enabled() or not self._baldr_is_matrix_text_event(event):
+            return False
+        grace = self._baldr_matrix_burst_grace_seconds()
+        if grace <= 0:
+            return False
+
+        state = self._baldr_matrix_burst_buffers.setdefault(
+            session_key,
+            {"items": [], "adapter": adapter, "first_ts": time.time()},
+        )
+        state["adapter"] = adapter
+        state["latest_event"] = event
+        state.setdefault("items", []).append({
+            "text": self._baldr_burst_item_text(event),
+            "message_id": event.message_id,
+        })
+
+        existing_task = self._baldr_matrix_burst_tasks.get(session_key)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+        task = asyncio.create_task(self._baldr_flush_matrix_burst(session_key))
+        self._baldr_matrix_burst_tasks[session_key] = task
+        try:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except TypeError:
+            pass
+
+        now = time.time()
+        last_ack = self._baldr_matrix_burst_ack_ts.get(session_key, 0)
+        if (
+            os.environ.get("BALDR_MATRIX_BURST_ACK_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+            and now - last_ack >= 20
+        ):
+            self._baldr_matrix_burst_ack_ts[session_key] = now
+            try:
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=f"принял поток; дособираю следующие сообщения ~{grace:.1f}с и отправлю одним запросом.",
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+            except Exception as exc:
+                logger.debug("Baldr Matrix burst buffer ack failed: %s", exc)
+        return True
 
     async def _baldr_enqueue_link_review(
         self,
@@ -2421,6 +2747,55 @@ class GatewayRunner:
             logger.debug("Baldr status snapshot failed: %s", exc)
         return None
 
+    @staticmethod
+    def _baldr_is_status_request(text: str) -> bool:
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return False
+        compact = re.sub(r"\s+", " ", lowered).strip(" ?!.,:;")
+        if compact in {
+            "status", "/status", "статус", "/статус", "чотам", "че там",
+            "чё там", "что там", "ты жив", "ты жив?", "жив", "жив?",
+            "are you alive",
+        }:
+            return True
+        if any(term in compact for term in (
+            "слово статус", "слова статус", "слово \"статус\"",
+            "если я использую слово", "использую слово статус",
+            "статусные", "статусных", "статусным", "статусными",
+        )):
+            return False
+        if compact.startswith("/status"):
+            return True
+        word_count = len(re.findall(r"[0-9a-zа-яё]+", compact, flags=re.I))
+        if any(term in compact for term in (
+            "что делаешь", "что ты делаешь", "что сейчас", "что там",
+            "чотам", "че там", "чё там", "почему молч", "сам работаешь",
+            "active tasks", "what tasks are running", "current tasks",
+            "текущие задачи", "что по задачам", "что активно",
+        )):
+            return word_count <= 12 or any(term in compact for term in ("задач", "tasks", "активно"))
+        has_status_word = bool(re.search(r"(?<![a-zа-яё])(?:status|статус)(?![a-zа-яё])", compact, flags=re.I))
+        if not has_status_word:
+            return False
+        if any(term in compact for term in (
+            "каков статус", "какой статус", "какая статус", "какие статусы",
+            "статус задачи", "статус задач", "статус по", "статус у",
+            "что со статусом", "что с задачей", "что по ", "как там по",
+            "где мы по", "current status of", "status of", "task status",
+        )):
+            return True
+        if any(term in compact for term in (
+            "задач", "таск", "task", "проект", "project", "переезд",
+            "переез", "миграц", "migration", "matrix", "матриц",
+            "матрикс", "gateway", "vps", "впс", "сервер", "server",
+            "root", "рут", "доступ", "access", "repo", "реп", "branch",
+            "ветк", "chess", "render", "final", "empire", "vpn",
+            "routing", "wireguard", "токен", "шифр", "e2ee",
+        )) and any(q in compact for q in ("каков", "какой", "какая", "какие", "что", "как", "где", "current", "what")):
+            return True
+        return compact.startswith(("status ", "статус ")) and word_count <= 8
+
     async def _baldr_control_reply_text(
         self,
         text: str,
@@ -2450,7 +2825,7 @@ class GatewayRunner:
             "не отвечаешь", "других линиях", "другие линии",
             "ревьювить", "косяк", "косяки",
         )
-        if any(term in lowered for term in status_terms):
+        if self._baldr_is_status_request(text) or any(term in lowered for term in status_terms):
             return await self._baldr_status_text(reply_context_text=reply_context_text or text)
         if any(term in lowered for term in report_terms):
             return (
@@ -2465,11 +2840,8 @@ class GatewayRunner:
             )
         if lane == "ops" and priority == "urgent":
             return "Принял как urgent ops. Остановлю обычную очередь и разберу доступ/Matrix/gateway первым."
-        if lane == "control" and execution == "answer_now":
-            # Do not emit generic filler for unknown control messages. If the
-            # local router cannot produce a concrete status/action reply, let
-            # the normal queue path handle the message instead.
-            return None
+        if lane == "control" and execution == "answer_now" and priority in {"high", "urgent"}:
+            return "Принял. Отвечаю как control-сообщение сразу; основная задача не должна блокировать этот ответ."
         return None
 
     @staticmethod
@@ -2528,11 +2900,16 @@ class GatewayRunner:
             # like "а это?", "почему?", "так и не ответил".
             route_text = f'[Replying to: "{str(reply_text)[:500]}"]\n\n{text}'
 
+        matrix_burst_candidate = (
+            self._baldr_matrix_burst_enabled()
+            and self._baldr_is_matrix_text_event(event)
+        )
         decision = await self._baldr_l0_route_json(
             event,
             session_key,
             reply_context_text=str(reply_text)[:500] if reply_text else None,
             timeout=2.0,
+            write=not matrix_burst_candidate,
         )
         decision_from_l0 = bool(decision)
         if not decision:
@@ -2550,8 +2927,26 @@ class GatewayRunner:
         )
         if decision_from_l0:
             route_event = dict(decision)
-            route_event["link_review_queue_id"] = link_review_item.get("id") if isinstance(link_review_item, dict) else None
-            route_event["should_interrupt"] = should_interrupt
+            route_event.update({
+                "source": route_event.get("source") or "matrix-busy-router",
+                "session_key": session_key,
+                "chat_id": event.source.chat_id,
+                "room_name": getattr(event.source, "chat_name", None),
+                "message_id": event.message_id,
+                "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+                "reply_anchor_text": str(reply_text)[:500] if reply_text else None,
+                "user_text": text[:1000],
+                "route_text": route_text[:1500],
+                "lane": lane,
+                "priority": priority,
+                "execution": execution,
+                "target_task_id": decision.get("task_id") or decision.get("target_task_id"),
+                "target_worker": decision.get("target_worker") or decision.get("worker"),
+                "link_review_queue_id": link_review_item.get("id") if isinstance(link_review_item, dict) else None,
+                "should_interrupt": should_interrupt,
+            })
+            if matrix_burst_candidate and execution == "answer_now":
+                self._append_baldr_route_event(route_event)
         else:
             route_event = {
                 "source": "matrix-busy-router",
@@ -2573,6 +2968,19 @@ class GatewayRunner:
             }
             self._append_baldr_route_event(route_event)
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+
+        if matrix_burst_candidate and execution in {"background", "delegate"}:
+            running_agent = self._running_agents.get(session_key)
+            run_started = self._running_agents_ts.get(session_key, 0)
+            if running_agent is _AGENT_PENDING_SENTINEL or (
+                run_started
+                and time.time() - run_started <= self._baldr_matrix_burst_grace_seconds() + 0.25
+            ):
+                # The first turn is still in its intake grace window. Let the
+                # cold-start coalescer drain this into the initial prompt.
+                return False
+            if await self._buffer_baldr_matrix_burst_handoff(event, session_key, adapter):
+                return True
 
         if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
             control_text = await self._baldr_control_reply_text(
@@ -2735,7 +3143,12 @@ class GatewayRunner:
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+                merge_text=self._baldr_is_matrix_text_event(event),
+            )
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -4474,6 +4887,12 @@ class GatewayRunner:
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
+            if hasattr(self, '_baldr_matrix_burst_buffers'):
+                self._baldr_matrix_burst_buffers.clear()
+            if hasattr(self, '_baldr_matrix_burst_tasks'):
+                self._baldr_matrix_burst_tasks.clear()
+            if hasattr(self, '_baldr_matrix_burst_ack_ts'):
+                self._baldr_matrix_burst_ack_ts.clear()
             self._shutdown_event.set()
 
             # Global cleanup: kill any remaining tool subprocesses not tied
@@ -5988,9 +6407,18 @@ class GatewayRunner:
 
         try:
             try:
+                coalesced_event = await self._maybe_coalesce_baldr_cold_burst(
+                    event,
+                    _quick_key,
+                    _run_generation,
+                )
+                if coalesced_event is None:
+                    return None
+                event = coalesced_event
+                source = event.source
                 await self._maybe_send_baldr_cold_start_ack(event, _quick_key)
             except Exception as _baldr_ack_exc:
-                logger.debug("Baldr cold-start ack hook failed: %s", _baldr_ack_exc)
+                logger.debug("Baldr cold-start coalescing/ack hook failed: %s", _baldr_ack_exc)
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
