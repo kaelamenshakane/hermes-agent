@@ -6244,11 +6244,10 @@ class GatewayRunner:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r",
+            "inbound message: platform=%s user=%s chat=%s msg_chars=%d",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview,
+            source.chat_id or "unknown", len(event.text or ""),
         )
 
         # Get or create session
