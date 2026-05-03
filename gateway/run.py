@@ -2451,7 +2451,7 @@ class GatewayRunner:
             "ревьювить", "косяк", "косяки",
         )
         if any(term in lowered for term in status_terms):
-            return await self._baldr_status_text(reply_context_text=reply_context_text)
+            return await self._baldr_status_text(reply_context_text=reply_context_text or text)
         if any(term in lowered for term in report_terms):
             return (
                 "Да: по завершении напишу сюда коротко — что сделал, "
