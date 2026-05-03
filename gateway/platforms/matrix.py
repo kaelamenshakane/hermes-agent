@@ -21,6 +21,7 @@ Environment variables:
     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
+    MATRIX_RECOVERY_KEY_FILE    Optional safe file target for generated recovery keys
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
 """
 
@@ -746,15 +747,26 @@ class MatrixAdapter(BasePlatformAdapter):
                     if own_xsign is None:
                         try:
                             new_recovery_key = await olm.generate_recovery_key()
-                            logger.warning(
-                                "Matrix: bootstrapped cross-signing for %s. "
-                                "SAVE THIS RECOVERY KEY — set "
-                                "MATRIX_RECOVERY_KEY for future restarts so "
-                                "the bot can re-sign its device after key "
-                                "rotation: %s",
-                                client.mxid,
-                                new_recovery_key,
-                            )
+                            recovery_key_file = os.getenv(
+                                "MATRIX_RECOVERY_KEY_FILE", ""
+                            ).strip()
+                            if recovery_key_file:
+                                path = Path(recovery_key_file)
+                                path.parent.mkdir(parents=True, exist_ok=True)
+                                path.write_text(new_recovery_key + "\n")
+                                path.chmod(0o600)
+                                logger.warning(
+                                    "Matrix: bootstrapped cross-signing for %s. "
+                                    "Recovery key written to configured secret file.",
+                                    client.mxid,
+                                )
+                            else:
+                                logger.warning(
+                                    "Matrix: bootstrapped cross-signing for %s. "
+                                    "Recovery key generated but not logged; set "
+                                    "MATRIX_RECOVERY_KEY_FILE to store it safely.",
+                                    client.mxid,
+                                )
                         except Exception as exc:
                             logger.warning(
                                 "Matrix: cross-signing bootstrap failed "
