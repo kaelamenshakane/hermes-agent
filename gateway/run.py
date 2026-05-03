@@ -2111,6 +2111,100 @@ class GatewayRunner:
             logger.debug("Baldr gateway hook failed: %s", exc)
             return None
 
+    async def _baldr_l0_route_json(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reply_context_text: Optional[str] = None,
+        timeout: float = 2.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Call the small external Baldr L0 router.
+
+        Payload is sent on stdin so Matrix text never appears in argv/process
+        listings.  The script is fail-open; errors fall back to the older
+        baldrctl path or regular busy queue handling.
+        """
+        if os.environ.get("BALDR_GATEWAY_L0_SCRIPT_ENABLED", "false").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return None
+        script = Path("/srv/agent/scripts/baldr-route-message.py")
+        if not script.exists():
+            return None
+        payload = {
+            "text": event.text or "",
+            "room_id": event.source.chat_id,
+            "room_name": getattr(event.source, "chat_name", None),
+            "user_id": getattr(event.source, "user_id", None),
+            "message_id": event.message_id,
+            "reply_text": reply_context_text,
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "session_key": session_key,
+            "source": "matrix-busy-router",
+        }
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script),
+                "--stdin-json",
+                "--json",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdin_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            stdout, _ = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=timeout)
+            if proc.returncode != 0 or not stdout:
+                return None
+            data = json.loads(stdout.decode("utf-8", errors="replace"))
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.debug("Baldr L0 router hook failed: %s", exc)
+            return None
+
+    async def _baldr_dispatch_worker_handoff(
+        self,
+        route: Dict[str, Any],
+        *,
+        timeout: float = 2.5,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a durable L1/L2 handoff for delegate/background routes."""
+        script = Path("/srv/agent/scripts/baldr-dispatch-worker.py")
+        pack_path = route.get("context_pack_path")
+        if not script.exists() or not pack_path:
+            return None
+        args = [str(script), "--route-json", str(pack_path), "--status", "pending", "--json"]
+        auto_start = os.environ.get("BALDR_GATEWAY_AUTO_DISPATCH", "true").lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if auto_start:
+            args.append("--start")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                logger.debug(
+                    "Baldr worker dispatch failed rc=%s stderr=%s",
+                    proc.returncode,
+                    stderr.decode("utf-8", errors="replace")[:500],
+                )
+                return None
+            data = json.loads(stdout.decode("utf-8", errors="replace")) if stdout else {}
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.debug("Baldr worker dispatch hook failed: %s", exc)
+            return None
+
     async def _baldr_enqueue_link_review(
         self,
         event: MessageEvent,
@@ -2372,36 +2466,50 @@ class GatewayRunner:
             # like "а это?", "почему?", "так и не ответил".
             route_text = f'[Replying to: "{str(reply_text)[:500]}"]\n\n{text}'
 
-        decision = await self._baldrctl_json("route", route_text, timeout=1.5)
+        decision = await self._baldr_l0_route_json(
+            event,
+            session_key,
+            reply_context_text=str(reply_text)[:500] if reply_text else None,
+            timeout=2.0,
+        )
+        decision_from_l0 = bool(decision)
+        if not decision:
+            decision = await self._baldrctl_json("route", route_text, timeout=1.5)
         if not decision:
             return False
 
         lane = str(decision.get("lane") or "control")
         execution = str(decision.get("execution") or "answer_now")
         priority = str(decision.get("priority") or "normal")
-        should_interrupt = self._baldr_should_interrupt_busy_turn(text, lane, priority)
+        should_interrupt = bool(decision.get("should_interrupt")) or self._baldr_should_interrupt_busy_turn(text, lane, priority)
         link_review_item = await self._baldr_enqueue_link_review(
             event,
             reply_anchor_text=str(reply_text)[:500] if reply_text else None,
         )
-        route_event = {
-            "source": "matrix-busy-router",
-            "session_key": session_key,
-            "chat_id": event.source.chat_id,
-            "message_id": event.message_id,
-            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
-            "reply_anchor_text": str(reply_text)[:500] if reply_text else None,
-            "user_text": text[:1000],
-            "route_text": route_text[:1500],
-            "lane": lane,
-            "priority": priority,
-            "execution": execution,
-            "target_task_id": decision.get("task_id") or decision.get("target_task_id"),
-            "target_worker": decision.get("target_worker") or decision.get("worker"),
-            "should_interrupt": should_interrupt,
-            "link_review_queue_id": link_review_item.get("id") if isinstance(link_review_item, dict) else None,
-        }
-        self._append_baldr_route_event(route_event)
+        if decision_from_l0:
+            route_event = dict(decision)
+            route_event["link_review_queue_id"] = link_review_item.get("id") if isinstance(link_review_item, dict) else None
+            route_event["should_interrupt"] = should_interrupt
+        else:
+            route_event = {
+                "source": "matrix-busy-router",
+                "session_key": session_key,
+                "chat_id": event.source.chat_id,
+                "room_name": getattr(event.source, "chat_name", None),
+                "message_id": event.message_id,
+                "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+                "reply_anchor_text": str(reply_text)[:500] if reply_text else None,
+                "user_text": text[:1000],
+                "route_text": route_text[:1500],
+                "lane": lane,
+                "priority": priority,
+                "execution": execution,
+                "target_task_id": decision.get("task_id") or decision.get("target_task_id"),
+                "target_worker": decision.get("target_worker") or decision.get("worker"),
+                "should_interrupt": should_interrupt,
+                "link_review_queue_id": link_review_item.get("id") if isinstance(link_review_item, dict) else None,
+            }
+            self._append_baldr_route_event(route_event)
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
 
         if execution == "answer_now" and lane in {"control", "ops", "cheap"}:
@@ -2435,14 +2543,45 @@ class GatewayRunner:
                                 exc,
                             )
                 return True
-        if execution in {"background", "delegate"} and lane in {"code", "research", "finalempire", "cheap"}:
-            # Do not auto-convert Matrix busy messages into visible /background
-            # runs. That caused noisy "Background task started/complete" replies
-            # to overtake newer user messages, while the original questions still
-            # looked missed. Fall through to the normal busy queue so ordering is
-            # preserved and a queued follow-up processes the user's exact message.
+        if (
+            execution in {"background", "delegate"}
+            and decision_from_l0
+            and os.environ.get("BALDR_GATEWAY_ROUTE_HANDOFF_ENABLED", "true").lower()
+            not in {"0", "false", "no", "off"}
+        ):
+            dispatch = await self._baldr_dispatch_worker_handoff(route_event)
+            if dispatch:
+                ack = str(route_event.get("ack_text") or "").strip()
+                if not ack:
+                    ack = (
+                        f"принял -> {route_event.get('project') or 'project'}/{lane}; "
+                        f"task={route_event.get('target_task_id') or 'task'}; отправил в worker"
+                    )
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=ack[:1200],
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                logger.info(
+                    "Baldr L0 dispatched Matrix busy route %s/%s for session %s",
+                    lane,
+                    execution,
+                    session_key,
+                )
+                return True
             logger.info(
-                "Baldr busy-route chose %s/%s for Matrix session %s; preserving order via busy queue instead of visible background task.",
+                "Baldr busy-route chose %s/%s but dispatch failed; preserving normal busy queue for session %s.",
+                lane,
+                execution,
+                session_key,
+            )
+            return False
+        if execution in {"background", "delegate"} and lane in {"code", "research", "finalempire", "cheap"}:
+            # Legacy fallback path: when the external L0 script is disabled or
+            # unavailable, preserve ordering through the normal busy queue.
+            logger.info(
+                "Baldr busy-route chose %s/%s for Matrix session %s; preserving order via busy queue.",
                 lane,
                 execution,
                 session_key,
