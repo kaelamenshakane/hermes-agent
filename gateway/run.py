@@ -2118,6 +2118,7 @@ class GatewayRunner:
         *,
         reply_context_text: Optional[str] = None,
         timeout: float = 2.0,
+        write: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Call the small external Baldr L0 router.
 
@@ -2147,10 +2148,11 @@ class GatewayRunner:
             "source": "matrix-busy-router",
         }
         try:
+            args = [str(script), "--stdin-json", "--json"]
+            if not write:
+                args.append("--no-write")
             proc = await asyncio.create_subprocess_exec(
-                str(script),
-                "--stdin-json",
-                "--json",
+                *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -2275,6 +2277,66 @@ class GatewayRunner:
             event,
             reply_anchor_text=str(getattr(event, "reply_to_text", None) or "")[:500] or None,
         )
+
+    async def _maybe_send_baldr_cold_start_ack(self, event: MessageEvent, session_key: str) -> None:
+        """Send a quick Matrix ack for long cold-start tasks.
+
+        Busy-session messages already get an L0 "принял → project/lane" reply.
+        Idle sessions used to provide only a read/reaction signal, so longer
+        tasks looked silent until the final answer.  This preview is no-write:
+        it does not create tasks or context packs, it only explains that the
+        current agent turn has taken the work.
+        """
+        if os.environ.get("BALDR_GATEWAY_COLD_ACK_ENABLED", "true").lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return
+        if not self._baldr_gateway_router_enabled():
+            return
+        if event.source.platform != Platform.MATRIX:
+            return
+        if event.message_type != MessageType.TEXT:
+            return
+        text = (event.text or "").strip()
+        if not text or event.is_command():
+            return
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter:
+            return
+        reply_text = getattr(event, "reply_to_text", None)
+        decision = await self._baldr_l0_route_json(
+            event,
+            session_key,
+            reply_context_text=str(reply_text)[:500] if reply_text else None,
+            timeout=1.5,
+            write=False,
+        )
+        if not decision:
+            return
+        execution = str(decision.get("execution") or "answer_now")
+        if execution not in {"background", "delegate"}:
+            return
+        lane = str(decision.get("lane") or "control")
+        project = str(decision.get("project") or "agent-host")
+        task_id = str(decision.get("target_task_id") or decision.get("task_id") or "task")
+        ack = str(decision.get("ack_text") or "").strip()
+        if ack:
+            ack = ack.replace("; отправляю в worker/context pack", "; беру в работу")
+        else:
+            ack = f"принял -> {project}/{lane}; task={task_id}; беру в работу"
+        thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        try:
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=ack[:1200],
+                reply_to=event.message_id,
+                metadata=thread_meta,
+            )
+        except Exception as exc:
+            logger.debug("Baldr cold-start ack failed: %s", exc)
 
     async def _baldr_status_text(self, reply_context_text: Optional[str] = None) -> Optional[str]:
         """Return a compact Baldr control-plane snapshot for Matrix busy replies."""
@@ -5925,6 +5987,10 @@ class GatewayRunner:
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            try:
+                await self._maybe_send_baldr_cold_start_ack(event, _quick_key)
+            except Exception as _baldr_ack_exc:
+                logger.debug("Baldr cold-start ack hook failed: %s", _baldr_ack_exc)
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
