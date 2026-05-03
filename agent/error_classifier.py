@@ -101,6 +101,20 @@ _BILLING_PATTERNS = [
     "exceeded your current quota",
     "account is deactivated",
     "plan does not include",
+    "free plan limit",
+    "free usage",
+    "usage cap",
+    "usage limit reached",
+    "out of usage",
+    "weekly limit",
+    "monthly limit",
+    "message cap",
+    "plan limit",
+    "limit for this plan",
+    "reached your current usage limit",
+    "you have reached your limit",
+    "allowance exhausted",
+    "allowance has been exhausted",
 ]
 
 # Patterns that indicate rate limiting (transient, will resolve)
@@ -125,9 +139,15 @@ _RATE_LIMIT_PATTERNS = [
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
 _USAGE_LIMIT_PATTERNS = [
     "usage limit",
+    "usage cap",
+    "message cap",
+    "allowance",
     "quota",
     "limit exceeded",
     "key limit exceeded",
+    "weekly limit",
+    "monthly limit",
+    "plan limit",
 ]
 
 # Patterns confirming usage limit is transient (not billing)
@@ -625,7 +645,20 @@ def _classify_by_status(
         )
 
     if status_code == 429:
-        # Already checked long_context_tier above; this is a normal rate limit
+        # Some account-plan exhaustion errors arrive as 429 even though
+        # retrying the same provider will not recover quickly.  Classify those
+        # as billing/plan exhaustion so Baldr can move to OpenRouter for a
+        # longer cooldown instead of pounding Codex every turn.
+        has_usage_limit = any(p in error_msg for p in _USAGE_LIMIT_PATTERNS)
+        has_transient_signal = any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS)
+        if any(p in error_msg for p in _BILLING_PATTERNS) or (has_usage_limit and not has_transient_signal):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
+        # Already checked long_context_tier above; this is a normal rate limit.
         return result_fn(
             FailoverReason.rate_limit,
             retryable=True,

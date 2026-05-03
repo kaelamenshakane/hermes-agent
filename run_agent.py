@@ -130,6 +130,11 @@ from tools.browser_tool import cleanup_browser
 from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.provider_health import (
+    cooldown_seconds_for as _provider_cooldown_seconds_for,
+    provider_cooldown as _provider_cooldown,
+    record_provider_failure as _record_provider_failure,
+)
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -7462,7 +7467,13 @@ class AIAgent:
 
     # ── Provider fallback ──────────────────────────────────────────────────
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        *,
+        message: str = "",
+        status_code: Optional[int] = None,
+    ) -> bool:
         """Switch to the next fallback model/provider in the chain.
 
         Called when the current model is failing after retries.  Swaps the
@@ -7474,15 +7485,36 @@ class AIAgent:
         auth resolution and client construction — no duplicated provider→key
         mappings.
         """
-        if reason in (FailoverReason.rate_limit, FailoverReason.billing):
-            # Only start cooldown when leaving the primary provider.  If we're
-            # already on a fallback and chain-switching, the primary wasn't the
-            # source of the 429 so the cooldown should not be reset/extended.
+        if reason in (
+            FailoverReason.rate_limit,
+            FailoverReason.billing,
+            FailoverReason.auth,
+            FailoverReason.auth_permanent,
+        ):
             fallback_already_active = bool(getattr(self, "_fallback_activated", False))
             current_provider = (getattr(self, "provider", "") or "").strip().lower()
+            current_model = (getattr(self, "model", "") or "").strip()
             primary_provider = ((self._primary_runtime or {}).get("provider") or "").strip().lower()
-            if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-                self._rate_limited_until = time.monotonic() + 60
+            should_cooldown_primary = (
+                reason in (FailoverReason.rate_limit, FailoverReason.billing)
+                and ((not fallback_already_active) or (primary_provider and current_provider == primary_provider))
+            )
+            try:
+                cooldown_seconds = _provider_cooldown_seconds_for(current_provider, reason)
+                _record_provider_failure(
+                    provider=current_provider,
+                    model=current_model,
+                    reason=reason,
+                    message=message,
+                    status_code=status_code,
+                    cooldown_seconds=cooldown_seconds,
+                )
+                if should_cooldown_primary:
+                    self._rate_limited_until = time.monotonic() + max(60, cooldown_seconds)
+            except Exception as e:
+                logging.debug("Provider health failure record skipped for %s: %s", current_provider, e)
+                if should_cooldown_primary:
+                    self._rate_limited_until = time.monotonic() + 60
         if self._fallback_index >= len(self._fallback_chain):
             return False
 
@@ -7491,7 +7523,23 @@ class AIAgent:
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
-            return self._try_activate_fallback()  # skip invalid, try next
+            return self._try_activate_fallback(reason=reason, message=message, status_code=status_code)  # skip invalid, try next
+        try:
+            fb_cooldown = _provider_cooldown(fb_provider)
+            if fb_cooldown.get("active"):
+                logging.warning(
+                    "Skipping fallback provider %s: cooldown active for %.0fs (reason=%s)",
+                    fb_provider,
+                    float(fb_cooldown.get("seconds_remaining") or 0),
+                    fb_cooldown.get("reason") or "unknown",
+                )
+                return self._try_activate_fallback(
+                    reason=reason,
+                    message=message,
+                    status_code=status_code,
+                )
+        except Exception as e:
+            logging.debug("Provider health fallback check skipped for %s: %s", fb_provider, e)
 
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
@@ -7520,7 +7568,7 @@ class AIAgent:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
-                return self._try_activate_fallback()  # try next in chain
+                return self._try_activate_fallback(reason=reason, message=message, status_code=status_code)  # try next in chain
             try:
                 from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -7656,7 +7704,7 @@ class AIAgent:
             return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
-            return self._try_activate_fallback()  # try next in chain
+            return self._try_activate_fallback(reason=reason, message=message, status_code=status_code)  # try next in chain
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
@@ -7678,6 +7726,22 @@ class AIAgent:
             return False  # primary still in rate-limit cooldown, stay on fallback
 
         rt = self._primary_runtime
+        try:
+            primary_provider = (rt.get("provider") or "").strip().lower()
+            cooldown = _provider_cooldown(primary_provider)
+            if cooldown.get("active"):
+                seconds_remaining = float(cooldown.get("seconds_remaining") or 0)
+                self._rate_limited_until = time.monotonic() + max(1, seconds_remaining)
+                logging.info(
+                    "Primary provider cooldown active; staying on fallback: %s for %.0fs (reason=%s)",
+                    primary_provider,
+                    seconds_remaining,
+                    cooldown.get("reason") or "unknown",
+                )
+                return False
+        except Exception as e:
+            logging.debug("Provider health primary restore check skipped: %s", e)
+
         try:
             # ── Core runtime state ──
             self.model = rt["model"]
@@ -12273,7 +12337,11 @@ class AIAgent:
                         )
                         if not pool_may_recover:
                             self._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                            if self._try_activate_fallback(reason=classified.reason):
+                            if self._try_activate_fallback(
+                                reason=classified.reason,
+                                message=classified.message,
+                                status_code=classified.status_code,
+                            ):
                                 retry_count = 0
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
